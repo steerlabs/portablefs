@@ -18,6 +18,8 @@ from linux_workspace_native_managed import NativeAuthority
 from linux_workspace_native_lifecycle import lifecycle_checks
 from linux_workspace_native_product import product_checks
 from linux_workspace_native_g0 import pause_checks
+from linux_workspace_native_ssh import SSHJobs
+from linux_workspace_native_reads import read_checks
 
 binary, image, evidence, inventory, *options = sys.argv[1:]
 assert options in ([], ['--defer-ui']), options
@@ -242,6 +244,7 @@ try:
     authority.initial_io(guest)
     record('managed-write-read-fsync')
     record('managed-peer-coherence')
+    read_checks(authority, guest, root / 'read-stress', record)
     managed = pause_checks(authority, guest, managed, record)
     token = uuid.uuid4().hex
     guest.ssh("printf '%s\\n' '" + token + "' > ~/persistence; sync -f ~/persistence")
@@ -328,8 +331,10 @@ try:
     fingerprint = subprocess.check_output(['/usr/bin/ssh-keygen', '-lf', str(state/'guest_host_key.pub')], text=True).split()[1]
     assert debug.returncode == 0 and 'Server host key: ssh-ed25519 ' + fingerprint in debug.stderr
     record('guest-host-key-persistence')
+    ssh_jobs = SSHJobs(guest.ssh, root / 'ssh-jobs', record)
     guest.stop(interrupt=True)
     guest = Guest()
+    ssh_jobs.check_shutdown(guest.ssh)
     root_death_mount = authority.mount(guest)
     guest.command('pause'); guest.wait('paused', 25)
     guest.command('resume'); guest.wait('resumed', 25)

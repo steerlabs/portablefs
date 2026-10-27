@@ -10,6 +10,8 @@
     "initramfs-tools",
     "systemd-sysv",
     "systemd-resolved",
+    "libpam-systemd",
+    "dbus-user-session",
     "openssh-server",
     "openssh-client",
     "bash",
@@ -227,6 +229,14 @@
     {
       "built_using": "",
       "package": "dbus-system-bus-common",
+      "source": "dbus",
+      "source_version": "1.16.2-2",
+      "static_built_using": "",
+      "version": "1.16.2-2"
+    },
+    {
+      "built_using": "",
+      "package": "dbus-user-session",
       "source": "dbus",
       "source_version": "1.16.2-2",
       "static_built_using": "",
@@ -1279,6 +1289,14 @@
       "source_version": "1.7.0-5",
       "static_built_using": "",
       "version": "1.7.0-5"
+    },
+    {
+      "built_using": "",
+      "package": "libpam-systemd:arm64",
+      "source": "systemd",
+      "source_version": "257.13-1~deb13u1",
+      "static_built_using": "",
+      "version": "257.13-1~deb13u1"
     },
     {
       "built_using": "",

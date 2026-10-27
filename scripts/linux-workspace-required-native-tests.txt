@@ -3,6 +3,10 @@ power-before-start
 exact-handshake
 fuse-init-7.31
 ssh-workspace-user
+ssh-logind-session
+ssh-user-manager-linger
+ssh-background-disconnect
+ssh-background-stop
 guest-development-toolchain
 immutable-root
 vsock-only-ssh
@@ -22,6 +26,7 @@ rtc-awake-measurement
 managed-standalone-provision
 managed-write-read-fsync
 managed-peer-coherence
+managed-large-repository-read-stress
 managed-suspend-resume-data
 managed-unmount-exact-cleanup
 managed-channel-loss-vm-discard
@@ -68,8 +73,10 @@ service-managed-ssh-config
 service-two-ssh-agents
 service-cursor-missing-extension
 service-cursor-remote-save-peer
+service-cursor-server-disconnect
 service-vscode-missing-extension
 service-vscode-remote-save-peer
+service-vscode-server-disconnect
 service-busy-removal-refusal
 service-stop-busy-preserves-running
 service-unmounted-path-denial

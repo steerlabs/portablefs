@@ -47,8 +47,8 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
     # Removal changes registration history. Fresh identities keep its teardown
     # separate from the crash and loss controls inherited from the service gate.
     ux = {'service-app-api-client','service-managed-ssh-config','service-two-ssh-agents',
-          'service-cursor-missing-extension','service-cursor-remote-save-peer',
-          'service-vscode-missing-extension','service-vscode-remote-save-peer',
+          'service-cursor-missing-extension','service-cursor-remote-save-peer','service-cursor-server-disconnect',
+          'service-vscode-missing-extension','service-vscode-remote-save-peer','service-vscode-server-disconnect',
           'service-busy-removal-refusal','service-stop-busy-preserves-running',
           'service-unmounted-path-denial','service-removal-keep-data','service-removal-delete-data',
           'service-background-consent-denied'}

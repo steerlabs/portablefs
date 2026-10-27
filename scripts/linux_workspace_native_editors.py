@@ -46,6 +46,28 @@ exports.activate = async () => {
 '''
 
 
+def server_processes(ssh, name):
+    # Inspect the actual Remote-SSH server, separately from its client-owned
+    # extension hosts. Never use its authentication material as test evidence.
+    source = r'''
+import json,pathlib
+out=[]
+for process in pathlib.Path('/proc').iterdir():
+    if not process.name.isdecimal():continue
+    try:
+        if process.stat().st_uid!=1000:continue
+        command=(process/'cmdline').read_bytes().split(b'\0')
+        if not any(arg.endswith(b'/out/server-main.js') for arg in command):continue
+        if not any(MARKER.encode() in arg for arg in command):continue
+        fields=(process/'stat').read_text().rsplit(')',1)[1].split()
+        if fields[0]=='Z':continue
+        out.append({'pid':int(process.name),'start':fields[19],'cgroup':(process/'cgroup').read_text()})
+    except (FileNotFoundError,ProcessLookupError,PermissionError):pass
+print(json.dumps(sorted(out,key=lambda p:p['pid'])))
+'''.replace('MARKER', repr('.cursor-server/' if name == 'cursor' else '.vscode-server/'))
+    return json.loads(ssh('python3 -c ' + shlex.quote(source)))
+
+
 def stop_editor(application, user):
     """Only this application's exact disposable profile can be retired."""
     prefixes=(str(application)+'/',str(application.resolve())+'/')
@@ -116,6 +138,7 @@ def editor_checks(host, env, config, home, evidence, authority, ssh, record, def
         record('service-' + name + '-missing-extension')
         if defer_ui:
             defer_case('service-' + name + '-remote-save-peer')
+            defer_case('service-' + name + '-server-disconnect')
             continue
         extension_id = 'anysphere.remote-ssh' if name == 'cursor' else 'ms-vscode-remote.remote-ssh'
         with (root/'extension-install.log').open('w') as log:
@@ -179,6 +202,20 @@ print(json.dumps({'iterations':iterations,'observedSaves':len(seen),'editor':res
             assert 'workspace' in processes, processes
             (root/'guest-editor-processes.txt').write_text(processes)
             record('service-' + name + '-remote-save-peer')
+            before = server_processes(ssh, name)
+            assert before, 'actual Remote-SSH server was not found'
+            assert all('/user.slice/user-1000.slice/' in p['cgroup'] and
+                       'portablefs-workspace-ssh@' not in p['cgroup'] for p in before), before
+            closed = stop_editor(application, user)
+            # Closing the disposable client disconnects its real SSH transport.
+            # The same server identities must remain through fresh connections.
+            for _ in range(3):
+                time.sleep(1)
+                after = server_processes(ssh, name)
+                assert all(p in after for p in before), (before, after)
+            (root/'server-disconnect.json').write_text(json.dumps({'before':before, 'after':after,
+                'client_cleanup':closed}, indent=2))
+            record('service-' + name + '-server-disconnect')
         finally:
             try:
                 if peer.poll() is None:

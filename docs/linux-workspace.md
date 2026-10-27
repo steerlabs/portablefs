@@ -690,6 +690,15 @@ unrelated SSH configuration. Qualify VS Code/Cursor, Zed and JetBrains Linux
 arm64 backends independently; local UI or AI networking does not establish that
 file tools execute in Linux.
 
+Public-key SSH uses Debian's PAM session stack and `pam_systemd` to place
+workspace processes in logind session scopes. Detached jobs remain in those
+scopes after disconnect; the workspace user's lingering manager and session
+bus also remain available. `/var` is volatile, so tmpfiles restores the linger
+marker at boot. The user manager waits for VM-bound bootstrap and the persistent
+home mount before loading user services. Ordinary VM shutdown still stops the
+session scopes and user manager. Password and keyboard-interactive authentication
+remain disabled.
+
 ## Guest artifact and boot path
 
 Run from an Apple-silicon Mac with macOS 26+, Xcode and Docker:
