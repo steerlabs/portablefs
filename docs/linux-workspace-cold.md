@@ -166,6 +166,12 @@ loss. The workspace outcome inventory uses a synced temporary file, atomic
 rename and directory sync. Persistence failure refuses acknowledgment. A crash
 cannot reconstruct volatile accepted-byte counts: its retained run stays
 unresolved/unobserved through replacement. No second write journal exists.
+A clean ordinary unmount resolves that serving interval only after the final
+accepted cut is durable, the connection has terminated and authenticated session
+detach and local cleanup succeed. With no retained loss or independent failure,
+finalization persists durable/observed/released before reporting cleanup. Exact
+kernel absence or successful cleanup of a terminal session cannot resolve an
+unknown write outcome.
 Affected file descriptions and old root barriers retain their errors across
 same-session recovery. Resolved retired epochs release their arenas and the
 accepted-cut references held by descriptions.

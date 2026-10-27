@@ -57,6 +57,8 @@ service-api-cli-five-verbs
 service-start-idempotent
 service-app-exit-vm-alive
 service-document-standalone
+service-used-clean-unmount-outcome
+service-used-clean-stop-outcome
 service-stop-persists
 service-ssh-identity-persistence
 service-crash-no-ram-adoption
