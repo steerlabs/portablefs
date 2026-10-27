@@ -12,10 +12,10 @@ import time
 import uuid
 
 
-def pause_checks(authority, guest, managed, record):
+def pause_checks(authority, guest, managed, record, durations=(5,15,45,150,600), modes=('normal','delayed','suppressed')):
     traces = []
-    for duration in (5, 15, 45, 150, 600):
-        for fencing in ('normal', 'delayed', 'suppressed'):
+    for duration in durations:
+        for fencing in modes:
             case = f'g0-vz-{fencing}-{duration}s'
             token = 'g0-' + uuid.uuid4().hex
             worker = None
@@ -46,6 +46,19 @@ print(json.dumps(result),flush=True)
                     assert ready.select(10), 'prestarted first operation not armed'
                     assert worker.stdout.readline().strip() == 'armed'
                 trace['worker_armed_host_ns'] = time.monotonic_ns()
+                # Arm the independent peer before pausing. Starting docker exec
+                # inside a 100 ms pause would measure process-launch latency
+                # instead of the guest/authority deadline boundary.
+                peer = subprocess.Popen(['docker','exec','-i','--user','200001:200001',authority.name,
+                    'python3','-u','-c',"import os,sys; print('peer-armed',flush=True); assert sys.stdin.readline().strip()=='publish'; p="+
+                    repr('/var/tmp/pfs-native/home/peer/'+token)+
+                    "; f=open(p,'wb'); f.write(b'peer-after-old-permission'); f.flush(); os.fsync(f.fileno()); f.close(); print('peer-complete',flush=True)"],
+                    text=True, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                with selectors.DefaultSelector() as ready:
+                    ready.register(peer.stdout, selectors.EVENT_READ)
+                    assert ready.select(10), 'independent peer not armed'
+                    assert peer.stdout.readline().strip() == 'peer-armed'
+                trace['peer_armed_host_ns'] = time.monotonic_ns()
                 if fencing != 'normal':
                     limit = time.monotonic()+10
                     while True:
@@ -58,8 +71,9 @@ print(json.dumps(result),flush=True)
                     # Let the old authority horizon age before the five-second
                     # case so the peer completes within the requested pause.
                     # No host observer can initiate cold recovery in this gap.
-                    time.sleep(6.5)
-                    trace['pre_pause_network_gap_seconds'] = 6.5
+                    gap = max(6.5, 10.1-duration)
+                    time.sleep(gap)
+                    trace['pre_pause_network_gap_seconds'] = gap
                     limit = time.monotonic()+10
                     while True:
                         guest.command('test-pause-unfenced')
@@ -79,10 +93,7 @@ print(json.dumps(result),flush=True)
                 # The ordinary peer is outside the guest and remains live.
                 # It waits for the actual authority obligation, then persists.
                 trace['peer_started_host_ns'] = time.monotonic_ns()
-                peer = subprocess.Popen(['docker','exec','--user','200001:200001',authority.name,
-                    'python3','-c',"import os; p="+repr('/var/tmp/pfs-native/home/peer/'+token)+
-                    "; f=open(p,'wb'); f.write(b'peer-after-old-permission'); f.flush(); os.fsync(f.fileno()); f.close(); print('peer-complete',flush=True)"],
-                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                peer.stdin.write('publish\n'); peer.stdin.flush()
                 target = time.monotonic()+duration
                 while time.monotonic()<target: time.sleep(min(.25,target-time.monotonic()))
                 # A normal cold fence may leave the old authority obligation

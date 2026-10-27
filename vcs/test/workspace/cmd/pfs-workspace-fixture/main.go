@@ -24,6 +24,7 @@ import (
 	"github.com/steerlabs/portablefs/vcs/internal/localroutes"
 	"github.com/steerlabs/portablefs/vcs/internal/mountlifecycle"
 	"github.com/steerlabs/portablefs/vcs/internal/volumecap"
+	"github.com/steerlabs/portablefs/vcs/internal/workspacecontrol"
 	"github.com/steerlabs/portablefs/vcs/internal/workspacehost"
 	pb "github.com/steerlabs/portablefs/vcs/internal/workspacepb"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -98,6 +99,9 @@ func run(args []string) error {
 			return errors.New("provision DIRECTORY ENDPOINT IDENTITY_BASE64")
 		}
 		lifetime := time.Hour
+		if os.Getenv("PFS_NATIVE_CLOCK_SOAK") == "1" {
+			lifetime = 96 * time.Hour
+		}
 		if args[0] == "provision-short" {
 			lifetime = 25 * time.Second
 		}
@@ -120,12 +124,25 @@ func run(args []string) error {
 			return err
 		}
 		return json.NewEncoder(os.Stdout).Encode(map[string]string{"mount": base64.StdEncoding.EncodeToString(mount), "public_key": base64.StdEncoding.EncodeToString(v.PublicKey), "guest_uuid": base64.StdEncoding.EncodeToString(v.GuestUuid), "identity_incarnation": base64.StdEncoding.EncodeToString(v.IdentityIncarnation)})
-	case "decode-status":
+	case "decode-status", "decode-status-evidence":
 		if len(args) != 2 {
-			return errors.New("decode-status BASE64")
+			return errors.New("decode-status or decode-status-evidence BASE64")
 		}
 		v := new(pb.StatusReply)
-		if err := decode(args[1], v); err != nil {
+		if args[0] == "decode-status-evidence" {
+			raw, err := base64.StdEncoding.DecodeString(args[1])
+			if err != nil {
+				return err
+			}
+			frame, err := workspacecontrol.Decode(raw)
+			if err != nil {
+				return err
+			}
+			v = frame.GetStatusReply()
+			if v == nil {
+				return errors.New("evidence has no status reply")
+			}
+		} else if err := decode(args[1], v); err != nil {
 			return err
 		}
 		raw, err := protojson.Marshal(v)
@@ -197,7 +214,11 @@ func issue(name string, pub ed25519.PublicKey, parent *x509.Certificate, signer 
 	if err != nil {
 		return nil, err
 	}
-	t := &x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: name}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(24 * time.Hour), BasicConstraintsValid: true, IsCA: ca, KeyUsage: x509.KeyUsageDigitalSignature}
+	lifetime := 24 * time.Hour
+	if os.Getenv("PFS_NATIVE_CLOCK_SOAK") == "1" {
+		lifetime = 96 * time.Hour
+	}
+	t := &x509.Certificate{SerialNumber: serial, Subject: pkix.Name{CommonName: name}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(lifetime), BasicConstraintsValid: true, IsCA: ca, KeyUsage: x509.KeyUsageDigitalSignature}
 	if ca {
 		t.KeyUsage |= x509.KeyUsageCertSign
 	} else if client {
@@ -285,7 +306,11 @@ func setup(dir, volume string) error {
 	// Fixed VZ pauses plus lifecycle checks can outlast an hour. Keep the
 	// independent peer authorized throughout the full inventory; guest expiry
 	// cases retain their separate short grants.
-	token, err := grant(k, volume, peer.RawSubjectPublicKeyInfo, 3*time.Hour)
+	peerLifetime := 3 * time.Hour
+	if os.Getenv("PFS_NATIVE_CLOCK_SOAK") == "1" {
+		peerLifetime = 96 * time.Hour
+	}
+	token, err := grant(k, volume, peer.RawSubjectPublicKeyInfo, peerLifetime)
 	if err != nil {
 		return err
 	}

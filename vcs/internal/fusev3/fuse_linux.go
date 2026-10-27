@@ -1385,6 +1385,14 @@ func (m *Mount) closeLocked() error {
 		return m.closeErr
 	}
 	m.closed = true
+	live := m.ctx.Err() == nil && !m.isRevoked() && m.rpc.SessionEndCause() == nil
+	if m.workspace != nil {
+		select {
+		case <-m.workspace.Done():
+			live = false
+		default:
+		}
+	}
 	barrierErr := errors.Join(m.prepareWorkspaceClose(), m.flushDelegationsBeforeClose())
 	m.cancel()
 	var replyOwnershipErr error
@@ -1433,6 +1441,12 @@ func (m *Mount) closeLocked() error {
 		}
 	}
 	m.closeErr = errors.Join(m.fatalError(), barrierErr, cleanupErr)
+	if m.workspaceLifecycle != nil {
+		// Close itself ends the local transport. Record health before that
+		// intentional terminal edge, without confusing later absence with
+		// a proof about an already-ended serving interval.
+		m.workspaceLifecycle.closeHealthy = live && !sessionEnded && m.closeErr == nil
+	}
 	return m.closeErr
 }
 

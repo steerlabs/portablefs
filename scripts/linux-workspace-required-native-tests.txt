@@ -145,3 +145,10 @@ g0-vz-cutoff-2000ms-10s-equal-phase2
 g0-vz-cutoff-2000ms-10s-above-phase0
 g0-vz-cutoff-2000ms-10s-above-phase1
 g0-vz-cutoff-2000ms-10s-above-phase2
+service-used-clean-unmount-outcome
+service-used-clean-stop-outcome
+service-crash-live-worker-refusal
+service-crash-same-boot-recovery
+service-crash-reconcile-unknown-retained
+service-loss-accepted-tail-peer
+service-loss-retained-after-clean-stop

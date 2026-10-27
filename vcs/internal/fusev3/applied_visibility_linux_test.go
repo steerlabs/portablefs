@@ -15,13 +15,16 @@ import (
 
 type refusedVisibilityRPC struct {
 	delegationRPC
-	failure error
+	failure func(context.Context) error
 }
 
 func (r refusedVisibilityRPC) CallIdempotent(ctx context.Context, q *authoritypb.Request) (*authoritypb.Response, error) {
 	if q.GetWaitVisibility() != nil {
 		if r.failure != nil {
-			return nil, r.failure
+			if err := r.failure(ctx); err != nil {
+				return nil, err
+			}
+			return r.delegationRPC.CallIdempotent(ctx, q)
 		}
 		return &authoritypb.Response{Errno: int32(syscall.EIO), Failure: authoritypb.FailureClass_FAILURE_CLASS_COHERENCE}, nil
 	}
@@ -120,17 +123,56 @@ func TestAppliedCreateVisibilityFailureDischargesBindingAndDescriptor(t *testing
 }
 
 func TestAppliedVisibilityIndependentFailureRemainsTerminal(t *testing.T) {
-	f := newStockFixture(t)
-	entry := f.lookup(t, 1, "appended")
-	opened := openDelegatedWriter(t, f, entry.NodeId)
-	cause := errors.New("malformed visibility reply")
-	f.mount.delegations.rpc = refusedVisibilityRPC{delegationRPC: f.mount.delegations.rpc, failure: cause}
-	status := f.rawCall(func(unique uint64) fuse.Status {
-		_, status := f.raw.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}, Fh: opened.Fh, Size: 4, Flags: uint32(syscall.O_RDWR | syscall.O_APPEND)}, []byte("data"))
-		return status
-	})
-	if status != fuse.EIO || !f.mount.isRevoked() || !errors.Is(f.mount.fatalError(), cause) {
-		t.Fatal("independent failure was hidden", status, f.mount.fatalError())
+	for _, backgroundFirst := range []bool{false, true} {
+		name := "foreground-failure"
+		if backgroundFirst {
+			name = "background-failure-before-source-completion"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newStockFixture(t)
+			entry := f.lookup(t, 1, "appended")
+			opened := openDelegatedWriter(t, f, entry.NodeId)
+			cause := errors.New("malformed visibility reply")
+			f.mount.delegations.rpc = refusedVisibilityRPC{delegationRPC: f.mount.delegations.rpc, failure: func(ctx context.Context) error {
+				lease := sourceLeaseFromContext(ctx)
+				if !backgroundFirst {
+					if lease != nil {
+						return cause
+					}
+					return nil
+				}
+				if lease != nil {
+					waitUntil(t, time.Second, "background terminal source withdrawal", func() bool {
+						f.raw.mu.RLock()
+						defer f.raw.mu.RUnlock()
+						return lease.revoked
+					})
+				}
+				return cause
+			}}
+			status := f.rawCall(func(unique uint64) fuse.Status {
+				_, status := f.raw.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{Unique: unique, NodeId: entry.NodeId}, Fh: opened.Fh, Size: 4, Flags: uint32(syscall.O_RDWR | syscall.O_APPEND)}, []byte("data"))
+				return status
+			})
+			// The original fixture injected the malformed reply into both
+			// foreground and background waits. If background durability wins,
+			// terminal withdrawal revokes the source before it can complete;
+			// that callback must report ENOTCONN. Isolate the foreground fault
+			// for its EIO contract and force the competing schedule separately.
+			want := fuse.EIO
+			if backgroundFirst {
+				want = fuse.Status(syscall.ENOTCONN)
+			}
+			if status != want || !f.mount.isRevoked() || !errors.Is(f.mount.fatalError(), cause) {
+				t.Fatal("independent failure was hidden", status, f.mount.fatalError())
+			}
+			f.rpc.mu.Lock()
+			writes := len(f.rpc.writes)
+			f.rpc.mu.Unlock()
+			if writes != 1 {
+				t.Fatal("terminal visibility failure changed the applied mutation", writes)
+			}
+		})
 	}
 }
 

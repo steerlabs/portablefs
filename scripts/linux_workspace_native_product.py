@@ -1,6 +1,10 @@
 """Throwaway SMAppService tests; no installed app identities or SSH config."""
 import base64
 import contextlib
+import fcntl
+import select
+import shlex
+import signal
 import json
 import os
 import pathlib
@@ -15,7 +19,32 @@ from concurrent.futures import ThreadPoolExecutor
 from linux_workspace_native_editors import editor_checks
 
 
-def product_checks(image, evidence, record, authority=None, api_only=False, defer_ui=False, defer_case=None):
+def execution_reference_busy(path):
+    fd=os.open(path,os.O_RDWR|os.O_NOFOLLOW|os.O_CLOEXEC)
+    try:
+        try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: return True
+        return False
+    finally: os.close(fd)
+
+
+def execution_reference_worker(path):
+    matches=[]
+    rows=subprocess.check_output(['ps','-Ao','pid=,comm='],text=True).splitlines()
+    for row in rows:
+        if not row.endswith('/com.apple.Virtualization.VirtualMachine'): continue
+        pid=int(row.split(None,1)[0])
+        observed=subprocess.run(['lsof','-a','-p',str(pid),'-Fpcfn','--',str(path)],text=True,capture_output=True)
+        if observed.returncode==0 and str(path) in observed.stdout: matches.append((pid,observed.stdout))
+    assert len(matches)==1,{'matching_workers':matches,'reference':str(path)}
+    return matches[0]
+
+
+def product_checks(image, evidence, record, authority=None, api_only=False, defer_ui=False, defer_case=None, outcome_case='crash'):
+    assert outcome_case in ('crash','loss') and (outcome_case!='loss' or authority is not None)
+    if outcome_case=='loss':
+        observe=record
+        record=lambda name:observe(name) if name.startswith('service-loss-') else None
     repo = pathlib.Path(__file__).resolve().parent.parent
     evidence = pathlib.Path(evidence)
     evidence.mkdir(parents=True, exist_ok=True)
@@ -144,8 +173,8 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         # The controlling agent uses computer use to toggle only this generated
         # Background Item. No global background-item reset or installed service
         # identifier participates. Files coordinate the two UI observations.
-        if defer_ui:
-            defer_case('service-background-consent-denied')
+        if defer_ui or outcome_case=='loss':
+            if outcome_case!='loss': defer_case('service-background-consent-denied')
         else:
             (evidence/'consent-fixture.json').write_text(json.dumps({**fixture, 'displayName': info['CFBundleName']},indent=2))
             print('AWAITING: disable throwaway Background Item; write '+str(evidence/'consent-denied'),flush=True)
@@ -188,6 +217,21 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         ssh('printf service-persistence > /home/workspace/service-product-proof')
         record('service-app-exit-vm-alive')
         before=(home/'.local/state/portablefs/workspace/client_ed25519.pub').read_bytes()
+        def mount_volume():
+            descriptor=subprocess.check_output(['docker','exec','--user','200001:200001',authority.name,
+                '/var/tmp/pfs-native/bin/pfs-workspace-fixture','document-connection','/var/tmp/pfs-native/home/test-pki',authority.endpoint,authority.volume],text=True)
+            connection=root/'connection.pfsworkspace';connection.write_text(descriptor)
+            app_command('--workspace-api','mount',str(connection))
+            waiting=until(lambda s:s['volumes'] and s['volumes'][0]['state']=='authorization-required' and s['volumes'][0].get('authorizationRequest'))
+            snapshot('authorization')
+            public=pathlib.Path(waiting['volumes'][0]['authorizationRequest']).read_bytes()
+            response=subprocess.check_output(['docker','exec','--user','200001:200001',authority.name,
+                '/var/tmp/pfs-native/bin/pfs-workspace-fixture','document-authorize','/var/tmp/pfs-native/home/test-pki',base64.b64encode(public).decode()],text=True)
+            authorized=root/'authorized.pfsworkspace';authorized.write_text(response)
+            app_command('--workspace-api','mount',str(authorized))
+            until(lambda s:s['volumes'] and s['volumes'][0]['state']=='ready')
+            snapshot('volume-ready')
+            return status()
         # Successful removal requires no unknown/lost outcome. Exercise it
         # before the volume workload, whose final guest evidence may be unknown.
         if authority is not None:
@@ -215,19 +259,7 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         record('service-removal-delete-data')
         app_command('--workspace-service-register');command('start');until(lambda s:s['state']=='running')
         if authority is not None:
-            descriptor=subprocess.check_output(['docker','exec','--user','200001:200001',authority.name,
-                '/var/tmp/pfs-native/bin/pfs-workspace-fixture','document-connection','/var/tmp/pfs-native/home/test-pki',authority.endpoint,authority.volume],text=True)
-            connection=root/'connection.pfsworkspace';connection.write_text(descriptor)
-            app_command('--workspace-api','mount',str(connection))
-            waiting=until(lambda s:s['volumes'] and s['volumes'][0]['state']=='authorization-required' and s['volumes'][0].get('authorizationRequest'))
-            snapshot('authorization')
-            public=pathlib.Path(waiting['volumes'][0]['authorizationRequest']).read_bytes()
-            response=subprocess.check_output(['docker','exec','--user','200001:200001',authority.name,
-                '/var/tmp/pfs-native/bin/pfs-workspace-fixture','document-authorize','/var/tmp/pfs-native/home/test-pki',base64.b64encode(public).decode()],text=True)
-            authorized=root/'authorized.pfsworkspace';authorized.write_text(response)
-            app_command('--workspace-api','mount',str(authorized))
-            until(lambda s:s['volumes'] and s['volumes'][0]['state']=='ready')
-            snapshot('volume-ready')
+            mount_volume()
             assert ssh('printf product-volume > /workspaces/native-managed/product-proof; sync; cat /workspaces/native-managed/product-proof')=='product-volume'
             record('service-document-standalone')
             with ThreadPoolExecutor(max_workers=2) as agents:
@@ -236,7 +268,7 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
                 assert first.result()=='volume-agent-two' and second.result()=='volume-agent-one'
             assert authority.peer("import pathlib; p=pathlib.Path('/var/tmp/pfs-native/home/peer'); print((p/'agent-one').read_text()+','+(p/'agent-two').read_text())")=='volume-agent-one,volume-agent-two'
             record('service-two-ssh-agents')
-            editor_checks(host,env,config,home,evidence/'editors',authority,ssh,record,defer_ui,defer_case)
+            if outcome_case!='loss': editor_checks(host,env,config,home,evidence/'editors',authority,ssh,record,defer_ui,defer_case)
             holder=subprocess.Popen(['ssh','-F',str(config),'portablefs-workspace',
                 'cd /workspaces/native-managed && echo holding && read -r release'],env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
             try:
@@ -257,7 +289,9 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
                 holder.stdin.write('release\n');holder.stdin.flush();holder.wait(timeout=15)
                 holder.stdin.close();holder.stdout.close();holder.stderr.close()
             app_command('--workspace-api','umount',authority.volume);until(lambda s:not s['volumes'])
-            snapshot('volume-removed')
+            settled=snapshot('volume-removed')
+            assert not settled['previousWriteOutcomeUnknown'] and not settled['someChangesWereNotSaved'],settled
+            record('service-used-clean-unmount-outcome')
             denied=subprocess.run(['ssh','-F',str(config),'portablefs-workspace',
                 'printf forbidden > /workspaces/native-managed/unmounted-proof'],env=env,capture_output=True,text=True,timeout=30)
             assert denied.returncode!=0 and ('Permission denied' in denied.stderr or 'does not exist' in denied.stderr),denied
@@ -265,21 +299,114 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
             record('service-unmounted-path-denial')
         command('stop','--json');until(lambda s:s['state']=='stopped' and not s['desiredRunning'])
         settled=snapshot('stopped-after-volume')
-        if settled['previousWriteOutcomeUnknown'] or settled['someChangesWereNotSaved']:
-            refused=app_command('--workspace-remove','delete',success=False)
-            assert refused.returncode!=0 and (home/'.local/state/portablefs/workspace/data.ext4').exists()
-            assert 'Previous write outcome unknown' in refused.stderr or 'Some changes were not saved' in refused.stderr
-            (evidence/'unmount-removal-refusal.txt').write_text(refused.stderr)
+        assert not settled['previousWriteOutcomeUnknown'] and not settled['someChangesWereNotSaved'],settled
+        record('service-used-clean-stop-outcome')
+        app_command('--workspace-remove','keep');app_command('--workspace-remove','keep')
+        assert (home/'.local/state/portablefs/workspace/data.ext4').exists()
+        app_command('--workspace-service-register')
         command('start');until(lambda s:s['state']=='running')
-        subprocess.run(['launchctl','kill','SIGKILL',f'gui/{os.getuid()}/{label}'],check=True)
-        crashed=True
-        until(lambda s:s['state']=='cleanup-required')
-        assert command('start',success=False).returncode!=0
+        if authority is not None: mount_volume()
+        if outcome_case=='loss':
+            payload=b'accepted-before-expiry'
+            script="""import errno,json,os
+f=os.open('/workspaces/native-managed/loss-proof',os.O_CREAT|os.O_TRUNC|os.O_WRONLY,0o600)
+print('opened',flush=True)
+input()
+assert os.write(f,b'accepted-before-expiry')==22
+print('accepted',flush=True)
+input()
+try: os.fsync(f); fsync_error=0
+except OSError as e: fsync_error=e.errno
+try: os.close(f); close_error=0
+except OSError as e: close_error=e.errno
+print(json.dumps({'fsync_errno':fsync_error,'close_errno':close_error}),flush=True)
+"""
+            writer=subprocess.Popen(['ssh','-F',str(config),'portablefs-workspace','python3 -u -c '+shlex.quote(script)],
+                env=env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+            def writer_line():
+                assert select.select([writer.stdout],[],[],30)[0], 'loss writer did not progress'
+                return writer.stdout.readline().strip()
+            try:
+                assert writer_line()=='opened'
+                authority.network(True)
+                try:
+                    writer.stdin.write('\n');writer.stdin.flush()
+                    assert writer_line()=='accepted'
+                    # Both the guest and authority's original cache horizons
+                    # expire while this accepted payload cannot reach storage.
+                    time.sleep(20)
+                finally: authority.network(False)
+                until(lambda s:s['volumes'] and s['volumes'][0]['state']=='ready')
+                writer.stdin.write('\n');writer.stdin.flush()
+                result=json.loads(writer_line())
+                assert result['fsync_errno']==5,result
+                assert writer.wait(timeout=20)==0
+                assert authority.peer("from pathlib import Path; assert Path('/var/tmp/pfs-native/home/peer/loss-proof').read_bytes()==b''; print('tail-not-applied')")=='tail-not-applied'
+                assert authority.peer("import os; p='/var/tmp/pfs-native/home/peer/loss-proof'; f=open(p,'wb'); f.write(b'peer-after-loss'); f.flush(); os.fsync(f.fileno()); f.close(); print('peer-durable')")=='peer-durable'
+                assert ssh('cat /workspaces/native-managed/loss-proof')=='peer-after-loss'
+                record('service-loss-accepted-tail-peer')
+            finally:
+                if writer.poll() is None: writer.terminate();writer.wait(timeout=20)
+                writer.stdin.close();writer.stdout.close();writer.stderr.close()
+            command('umount',authority.volume,'--json');until(lambda s:not s['volumes'])
+            command('stop','--json');settled=until(lambda s:s['state']=='stopped' and not s['desiredRunning'])
+            assert settled['someChangesWereNotSaved'],settled
+            statuses=[]
+            for raw in settled['retainedEvidence']:
+                page=json.loads(authority.fixture('decode-status-evidence',raw))
+                statuses += page.get('mounts',[]) + [r['mountStatus'] for r in page.get('retired',[]) if 'mountStatus' in r]
+            losses=[loss for row in statuses for loss in row.get('loss',[]) if int(loss.get('acceptedBytes','0'))==len(payload)]
+            assert losses and all(int(loss['acceptedEntries'])==1 for loss in losses), statuses
+            (evidence/'known-loss-retained.json').write_text(json.dumps({'status':settled,'losses':losses,'old_descriptor':result},indent=2))
+            refused=app_command('--workspace-remove','delete',success=False)
+            assert refused.returncode!=0 and 'Some changes were not saved' in refused.stderr
+            record('service-loss-retained-after-clean-stop')
+            return
+        old_boot=ssh('cat /proc/sys/kernel/random/boot_id')
+        if authority is not None:
+            assert ssh('cat /workspaces/native-managed/product-proof')=='product-volume'
+        reference=home/'.local/state/portablefs/workspace/owner.lock'
+        worker,observed=execution_reference_worker(reference)
+        assert execution_reference_busy(reference)
+        suspended=False
+        try:
+            os.kill(worker,signal.SIGSTOP);suspended=True
+            subprocess.run(['launchctl','kill','SIGKILL',f'gui/{os.getuid()}/{label}'],check=True)
+            crashed=True
+            refused=until(lambda s:s['state']=='cleanup-required')
+            assert command('start',success=False).returncode!=0
+            assert execution_reference_busy(reference)
+            (evidence/'crash-worker-held.json').write_text(json.dumps({'worker':worker,'lsof':observed,'status':refused},indent=2))
+            record('service-crash-live-worker-refusal')
+        finally:
+            if suspended: os.kill(worker,signal.SIGCONT)
+        deadline=time.monotonic()+30
+        while execution_reference_busy(reference):
+            assert time.monotonic()<deadline, 'VM worker retained execution reference after owner death'
+            time.sleep(.01)
+        if authority is not None:
+            assert authority.peer("import os; p='/var/tmp/pfs-native/home/peer/product-proof'; f=open(p,'wb'); f.write(b'peer-after-owner-crash'); f.flush(); os.fsync(f.fileno()); f.close(); print('peer-durable')")=='peer-durable'
+        command('start');until(lambda s:s['state']=='running')
+        assert ssh('cat /proc/sys/kernel/random/boot_id')!=old_boot
+        assert ssh('cat /home/workspace/service-product-proof')=='service-persistence'
+        assert (home/'.local/state/portablefs/workspace/client_ed25519.pub').read_bytes()==before
+        record('service-crash-same-boot-recovery')
         record('service-crash-no-ram-adoption')
+        if authority is not None:
+            mount_volume()
+            assert ssh('cat /workspaces/native-managed/product-proof')=='peer-after-owner-crash'
+            assert status()['previousWriteOutcomeUnknown']
+            command('umount',authority.volume,'--json');until(lambda s:not s['volumes'])
+        command('stop','--json');settled=until(lambda s:s['state']=='stopped' and not s['desiredRunning'])
+        if authority is not None:
+            assert settled['previousWriteOutcomeUnknown'],settled
+            (evidence/'crash-reconciled-unknown.json').write_text(json.dumps(settled,indent=2))
+            record('service-crash-reconcile-unknown-retained')
         refused=app_command('--workspace-remove','delete',success=False)
-        assert refused.returncode!=0 and (home/'.local/state/portablefs/workspace/data.ext4').exists()
+        assert refused.returncode!=0 and 'Previous write outcome unknown' in refused.stderr
         snapshot('cleanup')
         record('service-removal-unknown-refusal')
+        crashed=False
         finished=True
     finally:
         # This identity was generated by this invocation. Never unregister any

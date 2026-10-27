@@ -107,12 +107,15 @@ Pending Mount remains owned by the existing coordinator across power transitions
 A guest restart requests fresh initial authorization; persistent key/scope/epoch
 remain owned by the guest data disk.
 
-A durable execution witness is cleared only after confirmed VZ termination.
-Neither process exit nor a released service singleton proves VM absence. After
-an unconfirmed service crash, same-host-boot startup reports **Cleanup required**
-and refuses a successor. A different kernel boot-session identity proves the old
-execution absent. Automatic recovery earlier than that remains unproven by the
-public VZ lifetime contract; no old RAM is adopted or restored.
+A durable execution witness is cleared only after confirmed VZ termination or
+exact absence proof. Neither process exit nor a released service singleton proves
+VM absence. The service gives its locked `owner.lock` description to an immutable
+VZ serial attachment. A successor must acquire that exact pinned inode through a
+fresh description before constructing its VM. A retained VM descriptor keeps it
+busy after service death. Successful acquisition permits a cold successor while
+preserving prior outcomes; it never adopts old RAM. Replaced names and uncertain
+lock operations refuse. A different kernel boot-session identity also proves old
+execution absence. See [VM absence](linux-workspace-vm-absence.md).
 
 A `.pfsworkspace` file is at most 512 KiB of exact-version JSON. `kind` is
 `connection`, `request`, or `authorization`. A connection contains canonical TLS
@@ -1086,9 +1089,14 @@ measurement failures withdraw readiness and retry without exiting the service.
 `scripts/qualify-linux-workspace-clock.py --soak` runs 72 host-awake hours on
 an already-running exact-image guest, alternating three-hour idle/load blocks
 and sampling every 30 seconds. An explicit read-only NTS adapter supplies at
-least two independent authenticated UTC references, including server uncertainty;
-the harness charges the full reference collection and guest sampling/transit
-interval. Missing reference coverage is inconclusive. Source error must stay
+least two independent authenticated UTC references, including server uncertainty.
+`scripts/nts-reference/` supplies the read-only adapter in a separate test-only
+Go module. Build its binary before passing it as `--utc-reference-command`.
+The harness charges the full NTP exchange and guest sampling/transit interval.
+The adapter can bracket that exchange in the host's exact monotonic clock;
+the harness validates the named domain and both endpoints inside its invocation.
+NTS-KE completes before the fresh NTP timestamp. Without query brackets the
+whole command interval is charged. Missing reference coverage is inconclusive. Source error must stay
 within one second, quantization below one second, sample/set age and awake drift
 within 250 ms each, and conditional total error within three seconds. Separate
 UTC, RTC admission and G0 verdicts require matching first-read-after-resume and
@@ -1108,6 +1116,22 @@ unavailability and independent references during each pause. Missing driver or
 reference evidence is inconclusive. `--admission-evidence` consumes the exact
 native inventory's `results.json`; it cannot replace source qualification.
 No NTP setter, host-message fallback or clock server supplies admission.
+
+`scripts/qualify-linux-workspace-run.py IMAGE DEV_OWNER NTS_BINARY EVIDENCE
+--soak` owns a disposable guest, independent XFS authority/ordinary peer, and
+`caffeinate -i` assertion for that run. Build all three inputs from the same
+clean commit first. It adds live progress, causal guest pause campaigns and
+independently covered first-resume/duplicate-reader probes in the separate
+test-only initramfs on the product kernel. This probe does not replace or
+instrument the stock product guest's sole RTC owner. Generated fixture
+certificates/grants last 96 hours only when `PFS_NATIVE_CLOCK_SOAK=1`; ordinary
+native tests retain their shorter expiry cases. Launch the owner with a new
+session and redirected standard streams for unattended operation. SIGTERM or
+the evidence directory's `STOP` file requests cleanup after the active case;
+it can take twelve minutes to finish a long pause and recover. `status.json`,
+`clock/progress.json`, `clock/samples.jsonl` and `peer-heartbeats.jsonl` retain
+the run identity and measurements. A short run omits `--soak` and uses the
+thirty-minute dry-run schedule.
 
 A definite applied mutation is distinct from its later peer visibility wait.
 If that wait loses the old subscription, append/range callbacks still validate

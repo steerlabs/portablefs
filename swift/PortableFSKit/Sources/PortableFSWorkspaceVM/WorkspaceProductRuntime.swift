@@ -41,11 +41,11 @@ public extension WorkspaceProductRuntime { var failureMessage: String { "" } }
     private var updateQueued = false
     private var sshProbe: Process?
     private let sshHome: URL
-    public init(artifact: WorkspaceArtifact, directory: URL, sshHome: URL) throws {
+    public init(artifact: WorkspaceArtifact, directory: URL, executionReference: WorkspaceFileLock, sshHome: URL) throws {
         self.sshHome = sshHome
         guard artifact.release.commit == WorkspaceArtifact.hostBuildCommit else { throw WorkspaceVMError("Workspace image failed verification") }
-        state = try WorkspaceState(directory: directory)
-        vm = try WorkspaceMachine(artifact: artifact, dataDisk: directory.appendingPathComponent("data.ext4"), serialLog: directory.appendingPathComponent("serial.log"), machineID: state.machineID, macAddress: state.macAddress)
+        state = try WorkspaceState(directory: directory, ownership: executionReference)
+        vm = try WorkspaceMachine(artifact: artifact, dataDisk: directory.appendingPathComponent("data.ext4"), serialLog: directory.appendingPathComponent("serial.log"), machineID: state.machineID, macAddress: state.macAddress, executionReference: executionReference.fileHandle)
         channel = WorkspaceVsockChannel(vm: vm); bridge = WorkspaceSSHBridge(vm: vm, socket: state.socket)
         var hello = WorkspaceHello(); hello.release = artifact.release; hello.bootID = random.next(); hello.hostServiceID = random.next(); self.hello = hello
         coordinator = try WorkspaceCoordinator(host: hello, oldInstanceAbsent: true, vm: vm, power: power, channel: channel, clock: clock, nonces: random, startBudget: 150_000_000_000)
