@@ -6,6 +6,7 @@ import shlex
 import signal
 import subprocess
 import time
+import zipfile
 
 
 EDITOR_EXTENSION = r'''
@@ -45,6 +46,34 @@ exports.activate = async () => {
 '''
 
 
+def stop_editor(application, user):
+    """Only this application's exact disposable profile can be retired."""
+    prefixes=(str(application)+'/',str(application.resolve())+'/')
+    def owned():
+        result=[]
+        for line in subprocess.check_output(['ps','-axo','pid=,args='],text=True).splitlines():
+            try: pid,args=line.strip().split(None,1)
+            except ValueError: continue
+            if str(user) not in args: continue
+            command=subprocess.run(['ps','-p',pid,'-o','comm='],capture_output=True,text=True).stdout.strip()
+            if command.startswith(prefixes): result.append(int(pid))
+        return result
+    receipt={'terminated':[],'killed':[]}
+    for pid in owned():
+        try: os.kill(pid,signal.SIGTERM);receipt['terminated'].append(pid)
+        except ProcessLookupError: pass
+    deadline=time.monotonic()+5
+    while owned() and time.monotonic()<deadline: time.sleep(.1)
+    for pid in owned():
+        try: os.kill(pid,signal.SIGKILL);receipt['killed'].append(pid)
+        except ProcessLookupError: pass
+    deadline=time.monotonic()+2
+    while owned() and time.monotonic()<deadline: time.sleep(.1)
+    receipt['remaining']=owned()
+    assert not receipt['remaining'],receipt
+    return receipt
+
+
 def editor_checks(host, env, config, home, evidence, authority, ssh, record, defer_ui=False, defer_case=None):
     evidence = pathlib.Path(evidence)
     evidence.mkdir(parents=True, exist_ok=True)
@@ -55,13 +84,23 @@ def editor_checks(host, env, config, home, evidence, authority, ssh, record, def
     for name, application in applications.items():
         assert application.is_dir(), f'UNAVAILABLE: real {name}: {application}'
         root = evidence/name
-        user = root/'user-data'
-        extensions = root/'extensions'
-        test_home = root/'home'
+        root.mkdir(parents=True, exist_ok=True)
+        # Electron's singleton socket must fit Darwin's 103-byte Unix path.
+        # Evidence stays in the ledger; profiles stay in this fixture's short HOME.
+        profile_root = pathlib.Path(home).parent/'editors'/name
+        user = profile_root/'user-data'
+        extensions = profile_root/'extensions'
+        test_home = profile_root/'home'
         for directory in [user/'User', extensions, test_home]: directory.mkdir(parents=True, exist_ok=True)
         isolated = dict(env, HOME=str(test_home), VSCODE_PORTABLE='')
+        for inherited in ['ELECTRON_RUN_AS_NODE', 'VSCODE_IPC_HOOK_CLI', 'VSCODE_IPC_HOOK', 'CURSOR_IPC_HOOK_CLI']:
+            isolated.pop(inherited, None)
+        (root/'profile.json').write_text(json.dumps({'userData':str(user), 'extensions':str(extensions), 'home':str(test_home)},indent=2))
         settings = {'remote.SSH.configFile': str(config), 'remote.SSH.path':'/usr/bin/ssh',
-                    'remote.SSH.useLocalServer':False, 'security.workspace.trust.enabled':False,
+                    'security.workspace.trust.enabled':False,
+                    'security.promptForRemoteFileProtocolHandling':False,
+                    'remote.SSH.remotePlatform':{'portablefs-workspace':'linux'},
+                    'window.title':'PortableFS Workspace Test: ${rootName}',
                     'telemetry.telemetryLevel':'off', 'workbench.startupEditor':'none',
                     'update.mode':'none', 'extensions.autoUpdate':False, 'extensions.autoCheckUpdates':False,
                     'window.restoreWindows':'none', 'chat.disableAIFeatures':True}
@@ -82,12 +121,20 @@ def editor_checks(host, env, config, home, evidence, authority, ssh, record, def
         with (root/'extension-install.log').open('w') as log:
             subprocess.run([str(cli), *profile, '--install-extension', extension_id], env=isolated,
                            stdout=log, stderr=subprocess.STDOUT, check=True, timeout=240)
-        test = extensions/('portablefs.workspace-ux-' + name + '-1.0.0')
-        test.mkdir()
-        (test/'package.json').write_text(json.dumps({'name':'workspace-ux-' + name, 'publisher':'portablefs',
+        manifest = {'name':'workspace-ux-' + name, 'publisher':'portablefs',
             'version':'1.0.0', 'engines':{'vscode':'^1.90.0'}, 'main':'./extension.js',
-            'activationEvents':['onStartupFinished'], 'extensionKind':['ui']}))
-        (test/'extension.js').write_text(EDITOR_EXTENSION.replace('NAME', json.dumps(name)))
+            'activationEvents':['onStartupFinished'], 'extensionKind':['ui']}
+        # Register the probe through the real CLI; copying a folder does not
+        # add it to the editor's installed-extension registry.
+        probe = root/'workspace-ux-probe.vsix'
+        with zipfile.ZipFile(probe,'w',zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr('extension/package.json',json.dumps(manifest))
+            archive.writestr('extension/extension.js',EDITOR_EXTENSION.replace('NAME',json.dumps(name)))
+        with (root/'probe-install.log').open('w') as log:
+            subprocess.run([str(cli),*profile,'--install-extension',str(probe),'--force'],env=isolated,
+                           stdout=log,stderr=subprocess.STDOUT,check=True,timeout=60)
+        installed=subprocess.check_output([str(cli),*profile,'--list-extensions'],env=isolated,text=True,timeout=30)
+        assert 'portablefs.workspace-ux-'+name in installed.splitlines(),installed
         target = authority.target + '/ux-' + name + '-'
         # Only this fixture's mount and this editor's files participate.
         peer_script = '''import json,os,pathlib,time
@@ -133,14 +180,11 @@ print(json.dumps({'iterations':iterations,'observedSaves':len(seen),'editor':res
             (root/'guest-editor-processes.txt').write_text(processes)
             record('service-' + name + '-remote-save-peer')
         finally:
-            if peer.poll() is None: peer.terminate();peer.wait(timeout=10)
-            peer_log.close()
-            # Electron's CLI exits after spawning. Terminate only processes
-            # whose argument vector contains this exact isolated profile path.
-            listing=subprocess.check_output(['ps','-axo','pid=,args='],text=True)
-            for line in listing.splitlines():
-                if str(user) not in line: continue
-                pid=int(line.strip().split(None,1)[0])
-                if pid != os.getpid():
-                    try: os.kill(pid,signal.SIGTERM)
-                    except ProcessLookupError: pass
+            try:
+                if peer.poll() is None:
+                    peer.terminate()
+                    try: peer.wait(timeout=10)
+                    except subprocess.TimeoutExpired: peer.kill();peer.wait(timeout=10)
+            finally:
+                peer_log.close()
+                (root/'cleanup.json').write_text(json.dumps(stop_editor(application,user),indent=2))
