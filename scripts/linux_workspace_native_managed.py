@@ -22,7 +22,6 @@ class NativeAuthority:
         self.name = os.environ.get('PFS_NATIVE_FIXTURE_PREFIX', 'pfs-workspace-native-') + uuid.uuid4().hex[:10]
         self.helper = self.evidence / 'pfs-workspace-fixture'
         self.host_local = os.environ.get('PFS_NATIVE_LOCAL_AUTHORITY') == '1'
-        self.tunnel = None
         subprocess.run(['go', '-C', str(self.repo/'vcs'), 'build', '-o', str(self.helper),
                         './test/workspace/cmd/pfs-workspace-fixture'], check=True)
         image = os.environ.get('PORTABLEFS_CI_IMAGE', 'golang@sha256:fe3da92a5cb2881e4aa75e625cb0b7c50571632fb4cf340cbe53e6ccdcffdd51')
@@ -30,7 +29,7 @@ class NativeAuthority:
                         '--log-opt', 'max-size=8m', '--log-opt', 'max-file=3',
                         '-e', 'PFS_NATIVE_CLOCK_SOAK='+os.environ.get('PFS_NATIVE_CLOCK_SOAK','0'),
                         '-e', 'PFS_NATIVE_FIXTURE_CONTAINER=1', '-v', str(self.repo)+':/work:ro', '-w', '/work',
-                        '-p', ('127.0.0.1' if self.host_local else '0.0.0.0')+'::17443', image, 'bash', '/work/scripts/linux-workspace-native-authority.sh'],
+                        '-p', '0.0.0.0::17443', image, 'bash', '/work/scripts/linux-workspace-native-authority.sh'],
                        check=True, capture_output=True, text=True)
         try:
             deadline = time.monotonic() + 240
@@ -58,16 +57,14 @@ class NativeAuthority:
         return subprocess.check_output([str(self.helper), *args], text=True).strip()
 
     def connect_local(self, guest):
-        """Carry unchanged authority TLS over the guest's existing vsock SSH path."""
+        """Reach the wildcard-published TLS port through VZ's host-local bridge."""
         if not self.host_local:
             return
-        from g3_local_authority import AuthorityTunnel
-        self.tunnel = AuthorityTunnel(guest, self.published_port, self.evidence)
-        self.endpoint = self.tunnel.endpoint
+        from g3_local_authority import local_endpoint
+        self.endpoint, interface = local_endpoint(guest, self.published_port)
         (self.evidence/'native-authority.json').write_text(json.dumps(dict(
-            container=self.name, endpoint=self.endpoint, tunnel_pid=self.tunnel.process.pid,
-            published_endpoint='127.0.0.1:'+str(self.published_port),
-            topology='guest loopback -> owned SSH reverse forward over VZ vsock -> Mac loopback -> Docker port forward -> unchanged authority TLS; ordinary peer uses container loopback'), indent=2)+'\n')
+            container=self.name, endpoint=self.endpoint, host_interface=interface,
+            topology='guest VZ NAT -> host-local virtual bridge gateway -> Docker published port -> unchanged authority TLS; ordinary peer uses container loopback'), indent=2)+'\n')
 
     def peer(self, script):
         return subprocess.check_output(['docker', 'exec', '--user', '200001:200001', self.name,
@@ -398,9 +395,6 @@ print(json.dumps({'closed':True,'close_error':close_error}),flush=True)
 
     def close(self):
         hold_between_cases()
-        if self.tunnel is not None:
-            self.tunnel.close()
-            self.tunnel = None
         if not getattr(self, 'name', None):
             return
         logs = subprocess.run(['docker', 'logs', self.name], capture_output=True, text=True)

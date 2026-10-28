@@ -45,7 +45,7 @@ def write_status(evidence, status, body):
             f"Image manifest SHA-256: {status.get('image_manifest_sha256','unknown')}.\n"
             f"Guest system.ext4 SHA-256: {status.get('image_system_ext4_sha256','unknown')}.\n"
             f"Guest page size: {status.get('guest_page_size','preparing')} bytes.\n"
-            "Authority TLS uses an owned VZ/vsock SSH reverse forward and host loopback, independent of Wi-Fi and DNS.\n"
+            "Authority TLS uses the verified host-local VZ virtual bridge gateway, independent of Wi-Fi addressing and DNS.\n"
             "This run qualifies the UTC source on that image. Later directory-cache and workspace RTC-sampling "
             "consolidation changes affect the admission path; the final candidate's admission behavior requires "
             "the native G0 inventory. This source run does not substitute for that inventory.\n\n")

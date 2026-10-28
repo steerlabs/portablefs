@@ -7,29 +7,20 @@ import unittest
 from unittest import mock
 import g3_continuity
 import g3_product_rtc_reader
-from g3_local_authority import AuthorityTunnel
+from g3_local_authority import local_endpoint
 
 
 class SupportTests(unittest.TestCase):
-    def test_local_authority_uses_only_vsock_and_loopback_and_preserves_exit(self):
-        with tempfile.TemporaryDirectory() as directory:
-            guest=mock.Mock();guest.ready={'ssh_config':'owned-vsock-config'}
-            process=mock.Mock();process.poll.return_value=None
-            with mock.patch('g3_local_authority.subprocess.Popen',return_value=process) as start:
-                tunnel=AuthorityTunnel(guest,32123,pathlib.Path(directory))
-                command=start.call_args.args[0]
-                self.assertEqual(command[command.index('-R')+1],'127.0.0.1:17443:127.0.0.1:32123')
-                self.assertIn('ExitOnForwardFailure=yes',command)
-                self.assertNotIn('-O',command)
-                process.poll.return_value=1
-                with self.assertRaisesRegex(RuntimeError,'continuity lost'):tunnel.check()
-                tunnel.close();process.terminate.assert_not_called()
-            process.reset_mock();process.poll.return_value=None
-            with mock.patch('g3_local_authority.subprocess.Popen',return_value=process):
-                guest.ssh.side_effect=RuntimeError('forward unavailable')
-                with self.assertRaisesRegex(RuntimeError,'forward unavailable'):
-                    AuthorityTunnel(guest,32123,pathlib.Path(directory))
-                process.terminate.assert_called_once();process.wait.assert_called_once_with(timeout=5)
+    def test_local_authority_requires_the_guest_gateway_on_a_host_virtual_bridge(self):
+        guest=mock.Mock();guest.ssh.return_value='[{"gateway":"192.168.64.1"}]'
+        with mock.patch('g3_local_authority.subprocess.check_output',return_value='bridge100: flags=1\n    inet 192.168.64.1 netmask 0xffffff00\n'):
+            self.assertEqual(local_endpoint(guest,32123),('192.168.64.1:32123','bridge100'))
+        for interfaces in ('en0: flags=1\n    inet 192.168.64.1 netmask 0xffffff00\n','bridge100: flags=1\n    inet 192.168.65.1 netmask 0xffffff00\n'):
+            with mock.patch('g3_local_authority.subprocess.check_output',return_value=interfaces):
+                with self.assertRaises(AssertionError):local_endpoint(guest,32123)
+        for routes in ('[]','[{"gateway":"127.0.0.1"}]','[{"gateway":"8.8.8.8"}]'):
+            guest.ssh.return_value=routes
+            with self.assertRaises(AssertionError):local_endpoint(guest,32123)
 
     def continuity(self,path):
         guard=g3_continuity.Continuity.__new__(g3_continuity.Continuity)
