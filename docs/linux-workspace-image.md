@@ -2,7 +2,8 @@
 
 The guest is Debian 13 arm64 at the snapshot in
 `deploy/linux-workspace/image.lock.json`, with exact binary/source inventories,
-the 6.12.113 kernel and Go 1.26.10. The 3 GiB ext4 system disk is read-only.
+the signed `6.12.113+deb13-arm64-16k` kernel (Debian `6.12.113-1`),
+16 KiB pages and Go 1.26.10. The 3 GiB ext4 system disk is read-only.
 The owner creates the 64 GiB sparse persistent data disk locally; it is never
 part of an image or source download. Node.js, npm, Python pip/venv, Git and the
 C/C++ toolchain are installed before sealing the system disk.
@@ -55,6 +56,57 @@ requires `shutdown-completed`; it never retries a failed cycle. Its result
 file binds the kernel, image release and workload hash. Coordinate native VZ
 runs with other sessions on the same Mac. This soak supplements the exact
 native workspace inventory; it does not replace it.
+
+## 16 KiB pages and fail-stop
+
+The `linux-image-arm64-16k` flavour mitigates guest memory corruption observed
+with 4 KiB guests under normal host compression/swap pressure on Apple silicon.
+Failures included zeroed kernel objects, bad RSS counters and `bpf_prog_free`
+faults. An independent [VZ investigation](https://github.com/onexay/msl/issues/42)
+reported the same signatures and survival with 16 KiB guests. The suspected
+Apple-side mechanism remains unproven; a passing workload does not establish a
+general memory-pressure fix. No induced-pressure experiment runs beside the
+72-hour clock soak.
+
+The builder and offline coverage gate require the arm64 Image header's 16 KiB
+flag and `CONFIG_ARM64_16K_PAGES=y`. VZ boots that uncompressed Image and its
+matching initramfs directly through `VZLinuxBootLoader`. Both flavours use the
+same exact `linux-signed-arm64` and incorporated `linux` source versions.
+Every build regenerates the source archive with the actual kernel config and
+recipe; notices cover the new binary package names.
+
+The guest command line includes `oops=panic panic=-1`: the first oops panics
+and immediately takes VZ's stop/reboot boundary. Host handling uses the existing
+unexpected-stop path, retains unknown/lost outcomes and requires a fresh boot;
+RAM is never adopted. The native panic case adds a root-only SysRq trigger to
+a disposable copy of the system disk, retaining the product kernel, initramfs
+and command line. That fixture is not a distributable image.
+
+## Compatibility and known limits
+
+Native qualification checks `getconf PAGESIZE=16384`, Git, Node/npm,
+Python/pip/venv, gcc/make, ripgrep and Redis 8.2.3 built with `make -j4` and
+jemalloc. The Redis build must report jemalloc and configure `LG_PAGE=14`, then
+serve a local set/get and shut down. The managed workload requires 20 strict
+rounds over 31,500 files: each search returns exactly 3,150 matches and each
+Git status is clean, with empty stderr. Logs bind each workload and image.
+
+User-installed arm64 binaries still need compatible ELF segment alignment and
+allocators. Prebuilt jemalloc configured for 4 KiB pages can refuse a 16 KiB
+kernel; build for the target page size or use an appropriate version with
+runtime support. [Asahi's compatibility list](https://asahilinux.org/docs/sw/broken-software/)
+also records hardened_malloc and Android/Waydroid limitations. Rosetta remains
+outside the workspace contract. Small-file page-cache use can increase because
+each cached file consumes at least one 16 KiB page. These are compatibility
+limits, not incompatibilities established by the shipped-tool checks.
+
+Native harnesses append host memory evidence at start, end and every 60 seconds
+to `host-memory-pressure.jsonl`: memory-pressure levels, compressor stored and
+occupied bytes, compression/swap counters, swap usage and owned VM footprint.
+The VM PID must retain the exact test disk or execution-reference path.
+`footprint` reports compressed/swapped bytes together; it does not separate
+those states. Missing or exited workers are recorded as unavailable, never as
+zero compression. Sampling is read-only and does not induce pressure.
 
 ## Retained source and notices
 

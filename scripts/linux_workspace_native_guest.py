@@ -1,11 +1,13 @@
 """The stock native guest owner shared by full and focused qualification."""
 import json
 import queue
+import shutil
 import signal
 import subprocess
 import threading
 import time
 from linux_workspace_native_hold import hold_between_cases
+from linux_workspace_native_pressure import MemoryPressureRecorder
 
 
 def native_guest_class(binary, image, root, state, events, measurements):
@@ -17,6 +19,7 @@ def native_guest_class(binary, image, root, state, events, measurements):
             self.stderr = (root / ('owner-' + str(len(measurements)) + '.stderr')).open('w')
             self.p = subprocess.Popen([binary, image, str(state)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                       stderr=self.stderr, text=True, bufsize=1)
+            self.pressure = MemoryPressureRecorder(root / 'host-memory-pressure.jsonl', state / 'data.ext4')
 
             def read():
                 for line in self.p.stdout:
@@ -29,6 +32,7 @@ def native_guest_class(binary, image, root, state, events, measurements):
             try:
                 self.starting = self.wait('starting')
                 self.ready = self.wait('ready')
+                self.pressure.sample('start')
             except BaseException:
                 self.cleanup()
                 raise
@@ -49,11 +53,13 @@ def native_guest_class(binary, image, root, state, events, measurements):
 
         def discard(self):
             hold_between_cases()
+            self.pressure.sample('end')
             self.command('discard')
             value = self.wait('stopped', 30)
             assert value['operations'][-1] == 'stop-completed', value
             assert self.p.wait(timeout=10) == 0
             self.stderr.close()
+            self.finish()
 
         def ssh(self, command):
             result = subprocess.run(['/usr/bin/ssh', '-F', self.ready['ssh_config'], 'portablefs-workspace', command],
@@ -63,6 +69,7 @@ def native_guest_class(binary, image, root, state, events, measurements):
 
         def stop(self, interrupt=False):
             hold_between_cases()
+            self.pressure.sample('end')
             self.ssh('sync')
             if interrupt: self.p.send_signal(signal.SIGINT)
             else: self.command('stop')
@@ -70,14 +77,25 @@ def native_guest_class(binary, image, root, state, events, measurements):
             assert value['operations'][-1] == 'shutdown-completed'
             assert self.p.wait(timeout=10) == 0
             self.stderr.close()
+            self.finish()
+
+        def finish(self):
+            self.pressure.close()
+            if (state / 'serial.log').exists():
+                shutil.copyfile(state / 'serial.log', root / ('guest-%d-serial.log' % self.p.pid))
 
         def cleanup(self):
-            hold_between_cases()
-            if self.p.poll() is None:
-                self.command('stop')
-                try:
-                    self.p.wait(timeout=30)
-                except subprocess.TimeoutExpired:
-                    self.p.terminate(); self.p.wait(timeout=10)
+            try:
+                if self.p.poll() is None:
+                    try: self.command('stop')
+                    except (BrokenPipeError, ValueError): pass
+                    try: self.p.wait(timeout=30)
+                    except subprocess.TimeoutExpired:
+                        self.p.terminate()
+                        try: self.p.wait(timeout=30)
+                        except subprocess.TimeoutExpired: self.p.kill(); self.p.wait(timeout=10)
+            finally:
+                self.finish()
+                self.stderr.close()
 
     return Guest

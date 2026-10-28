@@ -19,6 +19,7 @@ from linux_workspace_native_ssh import SSHJobs
 from linux_workspace_native_reads import read_checks
 from linux_workspace_native_guest import native_guest_class
 from linux_workspace_native_hold import hold_between_cases
+from linux_workspace_native_16k import userspace_checks
 
 binary, image, evidence, inventory, *options = sys.argv[1:]
 assert options in ([], ['--defer-ui']), options
@@ -109,6 +110,11 @@ try:
     assert fuse['negotiated_major'] == 7 and fuse['negotiated_minor'] >= 31 and fuse['initialized'] is True
     measurements[-1]['fuse'] = fuse
     record('fuse-init-7.31')
+    assert guest.ssh('getconf PAGESIZE') == '16384'
+    assert guest.ssh('uname -r') == json.loads((pathlib.Path(image) / 'image-inputs.json').read_text())['lock']['kernel_release']
+    assert 'oops=panic' in guest.ssh('cat /proc/cmdline').split()
+    assert guest.ssh('cat /proc/sys/kernel/panic_on_oops') == '1'
+    record('guest-16k-page-size')
     assert guest.ssh('id -u; id -g; whoami').splitlines() == ['1000', '1000', 'workspace']
     assert guest.ssh("set -e; command -v python3 git cc; python3 -c 'print(6*7)'; git --version; cc --version").splitlines()[3] == '42'
     toolchain = guest.ssh('set -e; node --version; npm --version; python3 -m pip --version; '
@@ -179,7 +185,8 @@ try:
     authority.initial_io(guest)
     record('managed-write-read-fsync')
     record('managed-peer-coherence')
-    read_checks(authority, guest, root / 'read-stress', record)
+    read_checks(authority, guest, root / 'read-stress', record,
+                stress_work=lambda: userspace_checks(guest, root / 'userspace-16k', record))
     managed = pause_checks(authority, guest, managed, record)
     token = uuid.uuid4().hex
     guest.ssh("printf '%s\\n' '" + token + "' > ~/persistence; sync -f ~/persistence")
@@ -284,6 +291,7 @@ try:
     stopped = guest.wait('stopped', 25)
     assert stopped['operations'][-1] == 'stop-completed', stopped
     assert guest.p.wait(timeout=10) == 1
+    guest.finish()
     record('resume-single-use')
     record('managed-root-owner-death-vm-discard')
     guest = Guest()
@@ -292,10 +300,23 @@ try:
     stopped = guest.wait('stopped', 30)
     assert stopped['operations'][-1] == 'shutdown-completed'
     assert guest.p.wait(timeout=10) == 0
+    guest.finish()
     record('clean-stop')
     product_checks(image, root / "product", record, authority=authority, defer_ui=defer_ui, defer_case=defer_case)
     product_checks(image, root / "product-removal", record, authority=authority, outcome_case='removal', defer_ui=defer_ui, defer_case=defer_case)
     product_checks(image, root / "product-loss", record, authority=authority, outcome_case='loss', defer_ui=True, defer_case=lambda name: None)
+    product_checks(image, root / "product-panic", record, authority=authority, outcome_case='panic', defer_ui=True, defer_case=lambda name: None)
+    diagnostic = re.compile(r'BUG:|Oops:|Kernel panic - not syncing:|bad rss-counter|non-zero pgtables_bytes|Unable to handle kernel|rcu:.*stall', re.I)
+    serial_checks = []
+    for serial in sorted(root.rglob('*serial.log')):
+        if serial == root / 'product-panic/panic-serial.log': continue
+        hits = [line for line in serial.read_text(errors='replace').splitlines() if diagnostic.search(line)]
+        serial_checks.append({'path': str(serial.relative_to(root)), 'unexpected_diagnostics': hits})
+    (root / 'kernel-diagnostics.json').write_text(json.dumps(serial_checks, indent=2) + '\n')
+    assert serial_checks and all(not check['unexpected_diagnostics'] for check in serial_checks), serial_checks
+    pressure = [json.loads(line) for line in (root / 'host-memory-pressure.jsonl').read_text().splitlines()]
+    assert {'start', 'interval', 'end'} <= {row['phase'] for row in pressure}
+    assert any('vm' in row for row in pressure), 'missing owned VM compressed-memory evidence'
     assert sorted(passed + not_run) == sorted(required), (passed, not_run, required)
     (root / 'results.json').write_text(json.dumps({'required': required, 'passed': passed, 'notRun': not_run, 'qualified': not not_run, 'measurements': measurements, 'state': str(state), 'image_manifest_sha256': hashlib.sha256((pathlib.Path(image)/'manifest.json').read_bytes()).hexdigest(), 'rtc_admission': 'pass', 'utc': 'inconclusive', 'g0': 'inconclusive', 'first_read_after_resume': True, 'concurrent_duplicate_readers': True}, indent=2) + '\n')
     if not_run:

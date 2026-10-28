@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from linux_workspace_native_pressure import MemoryPressureRecorder
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('binary', type=pathlib.Path)
@@ -44,6 +45,7 @@ for number in range(1, args.cycles + 1):
     started = time.monotonic()
     record = {'cycle': number, 'passed': False, 'kernel_diagnostics': []}
     process = None
+    pressure = MemoryPressureRecorder(out / 'host-memory-pressure.jsonl', state / 'data.ext4')
     try:
         with (out / 'owner.stderr').open('w') as stderr, (out / 'events.jsonl').open('w') as transcript:
             process = subprocess.Popen([str(args.binary.resolve()), str(args.image.resolve()), str(state)],
@@ -67,6 +69,7 @@ for number in range(1, args.cycles + 1):
                     assert event['event'] not in ('failure', 'eof'), event
 
             ready = wait('ready', 180)
+            pressure.sample('ready')
             ssh = ['/usr/bin/ssh', '-F', ready['ssh_config'], 'portablefs-workspace']
             actual = subprocess.check_output([*ssh, 'uname -r'], text=True, timeout=30).strip()
             assert actual == kernel, (actual, kernel)
@@ -75,6 +78,7 @@ for number in range(1, args.cycles + 1):
                                      stdout=log, stderr=subprocess.STDOUT, timeout=180)
             assert run.returncode == 0, ('workload failed', run.returncode)
             record['workload_completed'] = True
+            pressure.sample('stop-request')
             process.stdin.write('{"command":"stop"}\n'); process.stdin.flush()
             stopped = wait('stopped', 30)
             record['operations'] = stopped['operations']
@@ -95,6 +99,7 @@ for number in range(1, args.cycles + 1):
                 process.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 process.kill(); process.wait()
+        pressure.close()
         serial = state / 'serial.log'
         if serial.exists():
             shutil.copyfile(serial, out / 'serial.log')

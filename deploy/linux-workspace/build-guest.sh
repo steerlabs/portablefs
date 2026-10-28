@@ -77,9 +77,13 @@ python3 - <<'PYKERNEL'
 with open('/output/kernel','rb') as f:
     header=f.read(64)
 assert header[56:60] == b'ARM\x64', 'expected uncompressed Debian arm64 Image'
+assert (int.from_bytes(header[24:32], 'little') >> 1) & 3 == 2, 'expected 16 KiB arm64 Image'
 PYKERNEL
 cp "$root/boot/initrd.img-$kernel" /output/initramfs
 cp "$root/boot/config-$kernel" /output/kernel.config
+python3 - <<'PYPAGES'
+assert "CONFIG_ARM64_16K_PAGES=y\n" in open("/output/kernel.config").read(), "expected 16 KiB kernel config"
+PYPAGES
 chroot "$root" dpkg-query -W -f='${binary:Package}\t${Version}\t${source:Package}\t${source:Version}\t${Built-Using}\t${Static-Built-Using}\n' > /output/packages.tsv
 python3 - <<'PYINVENTORY'
 import json,os,pathlib
