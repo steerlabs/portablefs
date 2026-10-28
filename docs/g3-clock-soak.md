@@ -9,6 +9,12 @@ still invalidate the run. NTS references retain their external network
 dependency and all coverage rules. The owner verifies the running guest's
 16,384-byte page size and `oops=panic` argument before sampling.
 
+Ordinary measurements use a prestarted SSH probe channel. Each request retains
+its complete host send/response bracket, including any guest command latency.
+Request identities prevent a delayed response from a planned pause from being
+assigned to a later slot; late responses remain in a separate append-only log.
+The sampling expression and all uncertainty and failure rules are unchanged.
+
 The qualifier accepts one uninterrupted, host-awake 72-hour run. Its 8,640
 half-open 30-second slots are distinct from the closing observation. At least
 8,554 slots must contain authenticated, agreeing NTS evidence from two approved

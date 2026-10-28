@@ -11,6 +11,23 @@ from g3_local_authority import local_endpoint
 
 
 class SupportTests(unittest.TestCase):
+    def test_prestarted_probe_preserves_late_replies_without_reusing_them(self):
+        import subprocess
+        import sys
+        from g3_sample_probe import ProbeSession, WORKER
+        source="import time\nn=0\ndef collect():\n global n\n n+=1\n if n==1:time.sleep(.1)\n return dict(sequence=n)\n"+WORKER
+        with tempfile.TemporaryDirectory() as directory:
+            root=pathlib.Path(directory)
+            session=ProbeSession([sys.executable,'-u','-c',source],root)
+            try:
+                with self.assertRaises(subprocess.TimeoutExpired):session.probe(timeout=.01)
+                self.assertEqual(session.probe(timeout=2),dict(sequence=2))
+                late=[json.loads(line) for line in (root/'probe-late-responses.jsonl').read_text().splitlines()]
+                self.assertEqual(late,[dict(request_id=1,sample=dict(sequence=1))])
+                self.assertEqual(session.probe(timeout=2),dict(sequence=3))
+            finally:session.close()
+            self.assertEqual(session.process.returncode,0)
+
     def test_local_authority_requires_the_guest_gateway_on_a_host_virtual_bridge(self):
         guest=mock.Mock();guest.ssh.return_value='[{"gateway":"192.168.64.1"}]'
         with mock.patch('g3_local_authority.subprocess.check_output',return_value='bridge100: flags=1\n    inet 192.168.64.1 netmask 0xffffff00\n'):

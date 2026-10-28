@@ -24,6 +24,8 @@ import re
 import sys
 import selectors
 import uuid
+from g3_sample_probe import ProbeSession, WORKER
+
 from g3_continuity import verify_owner, verify_awake, host_pair, record_invalid
 from g3_coverage import (OPERATORS, BoundViolation, ReferenceDisagreement, coverage_verdict, campaign_coverage, causal_generation)
 
@@ -149,7 +151,15 @@ with tempfile.TemporaryDirectory(prefix='pfs-clock-load-') as root:
    hashlib.sha256(data).digest()
   for f in p.glob('source-*'): compile(f.read_text(),str(f),'exec')
 '''
-PROBE = "python3 -c " + shlex.quote("import json,time,pathlib,subprocess; m=json.load(open('/run/portablefs-workspace/clock.json')); print(json.dumps(dict(measurement=m,elapsed_ns=time.clock_gettime_ns(time.CLOCK_BOOTTIME),wall_ns=time.time_ns(),boot_id=pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip(),service_pid=subprocess.check_output(['systemctl','show','--property=MainPID','--value','portablefs-workspaced'],text=True).strip())))")
+COLLECT_SOURCE = r'''def collect():
+ import json,time,pathlib,subprocess
+ m=json.load(open('/run/portablefs-workspace/clock.json'))
+ return dict(measurement=m,elapsed_ns=time.clock_gettime_ns(time.CLOCK_BOOTTIME),
+             wall_ns=time.time_ns(),boot_id=pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+             service_pid=subprocess.check_output(['systemctl','show','--property=MainPID','--value','portablefs-workspaced'],text=True).strip())
+'''
+PROBE = "python3 -c " + shlex.quote(COLLECT_SOURCE+"\nimport json;print(json.dumps(collect()))")
+SESSION_SOURCE = COLLECT_SOURCE + '\n' + WORKER
 
 
 def stop_load(load):
@@ -363,6 +373,11 @@ def main():
     ssh = ['ssh','-F',a.ssh_config,'portablefs-workspace']
     transport=ProbeTransport(ssh,a.probe_control_path,a.evidence) if a.probe_control_path else None
     if transport: ssh=transport.command
+    try:
+        session=ProbeSession(ssh+['python3 -u -c '+shlex.quote(SESSION_SOURCE)],a.evidence) if transport else None
+    except BaseException:
+        if transport: transport.close()
+        raise
     run_id = a.run_id or str(uuid.uuid4())
     host_awake_origin=host_pair()
     start_ns = time.monotonic_ns()
@@ -430,7 +445,7 @@ def main():
                     row['reference_error']=str(error)
                     if isinstance(error,BoundViolation): row.update(bound_violation=True,error=str(error))
             try:
-                row['sample']=json.loads(subprocess.check_output(ssh+[PROBE],text=True,timeout=10))
+                row['sample']=session.probe() if session else json.loads(subprocess.check_output(ssh+[PROBE],text=True,timeout=10))
                 row['sample_ended_ns']=time.monotonic_ns()
             except (OSError,ValueError,subprocess.SubprocessError) as error:
                 row.update(error=str(error),error_type=type(error).__name__,sample_ended_ns=time.monotonic_ns())
@@ -452,7 +467,7 @@ def main():
                 disruption=dict(run_id=run_id,error=str(error),observed_ns=time.monotonic_ns())
                 run_disruptions.append(disruption);row['disruption']=disruption
                 if a.invalid_file: record_invalid(a.invalid_file,disruption)
-            if transport and transport.process.poll() is not None:
+            if transport and (transport.process.poll() is not None or session.process.poll() is not None):
                 disruption=dict(run_id=run_id,error='owned probe SSH connection exited',observed_ns=time.monotonic_ns())
                 run_disruptions.append(disruption)
                 if a.invalid_file: record_invalid(a.invalid_file,disruption)
@@ -480,6 +495,7 @@ def main():
         sample_file.close()
         campaign.finish()
         if load is not None and not stop_load(load): failures.append('owned guest load failed')
+        if session: session.close()
         if transport: transport.close()
     try:
         verify_awake(host_awake_origin,host_pair())
