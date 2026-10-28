@@ -132,5 +132,19 @@ class SupportTests(unittest.TestCase):
                         self.assertEqual(guest.stop(),dict(outcome=operation,graceful=operation=='shutdown-completed',owner_returncode=0))
                         guest.p.wait.assert_called_once_with(timeout=10)
 
+    def test_global_hold_stops_proof_but_exempts_running_soak(self):
+        import importlib.util
+        spec=importlib.util.spec_from_file_location('hold_owner',pathlib.Path(__file__).with_name('qualify-linux-workspace-run.py'))
+        owner=importlib.util.module_from_spec(spec);spec.loader.exec_module(owner)
+        with tempfile.TemporaryDirectory() as directory:
+            hold=pathlib.Path(directory)/'HOLD'
+            self.assertFalse(owner.running_hold(hold,False))
+            hold.touch()
+            self.assertTrue(owner.running_hold(hold,False))
+            self.assertFalse(owner.running_hold(hold,True))
+            status=dict(soak=True,candidate_commit='pinned',image_manifest_sha256='digest')
+            owner.write_status(pathlib.Path(directory),status,'running')
+            self.assertIn('exempt from the heavy token', (pathlib.Path(directory)/'STATUS.md').read_text())
+
 
 if __name__=='__main__':unittest.main()

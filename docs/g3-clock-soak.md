@@ -80,11 +80,16 @@ Qualification is conditional on the trusted host and authenticated reference ser
 not prove server UTC correctness or future clock behavior. The native
 sampling/use-straddle and resident-kernel-state residual remain unproven.
 
-During a coordinator HOLD, no new native work begins. An active qualification
-stops, its evidence remains invalid/incomplete, and container cleanup is deferred.
+During a coordinator HOLD, no new native work begins. An active proof stops,
+its evidence remains invalid/incomplete, and container cleanup is deferred.
 The owner must not unpause, stop, kill, remove or replace a coordinator-paused
 container. A later explicit release authorizes cleanup and a new run, never
 continuation of the interrupted timer.
+
+The overnight heavy-work protocol exempts an already-running 72-hour soak from
+the token and later global HOLD windows. Its planned campaigns and reference
+collection continue. Startup still refuses HOLD, and actual unplanned authority
+pause, host sleep or continuity loss still invalidates the run.
 
 After sampling ends, cleanup records whether the owned VM shut down gracefully
 or used the dev owner's bounded fallback stop. Both require the exact terminal

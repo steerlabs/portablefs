@@ -47,7 +47,13 @@ def write_status(evidence, status, body):
             "This run qualifies the UTC source on that image. Later directory-cache and workspace RTC-sampling "
             "consolidation changes affect the admission path; the final candidate's admission behavior requires "
             "the native G0 inventory. This source run does not substitute for that inventory.\n\n")
+    if status.get('soak'):
+        notice += "Once running, this soak is exempt from the heavy token and later global HOLD windows. Unplanned disruption still invalidates it.\n\n"
     (evidence/'STATUS.md').write_text('# G3 clock run\n\n'+notice+body)
+
+
+def running_hold(hold, soak):
+    return hold.exists() and not soak
 
 
 def cleanup_owned_resources(authority, guest, managed, peer, hold, status):
@@ -170,6 +176,7 @@ def main():
     caffeinate = subprocess.Popen(['caffeinate','-i','-w',str(os.getpid())])
     now = lambda: datetime.datetime.now(datetime.timezone.utc)
     status = dict(pid=os.getpid(), launched=now().isoformat(), state_directory=str(state),
+                  soak=args.soak,
                   candidate_commit=pins['candidate_commit'], image_commit=pins['image_commit'],
                   image_system_ext4_sha256=pins['system_ext4_sha256'],
                   image_manifest_sha256=hashlib.sha256((args.image/'manifest.json').read_bytes()).hexdigest(),
@@ -223,7 +230,7 @@ def main():
                         assert case['image_manifest_sha256'] == status['image_manifest_sha256']
                         assert case['host_sleep'] is False
                         assert case['run_id']==run_id
-                        if hold.exists():
+                        if running_hold(hold,args.soak):
                             atomic(evidence/'coordinator-request.json',dict(reason='HOLD blocks VZ pause/load campaign; coordinator decision required',case=case))
                             stop.touch()
                             raise RuntimeError('HOLD appeared: coordinator required before pause/load campaign')
@@ -238,7 +245,7 @@ def main():
                             probe=ProductProbe(guest,args.reference.resolve())
                             managed = pause_checks(authority,guest,managed,lambda _: None,
                                                    durations=(case['pause_seconds'],),modes=(case['fencing'],),
-                                                   rtc_probe=probe,load=case['load'],hold_file=hold)
+                                                   rtc_probe=probe,load=case['load'],hold_file=None if args.soak else hold)
                         finally:
                             authority.evidence = prior_evidence
                         trace = json.loads((directory/'g0-vz-pauses.json').read_text())[0]
@@ -282,6 +289,7 @@ while True:
         event_log=(evidence/'authority-events.jsonl').open('w')
         event_process=subprocess.Popen(['docker','events','--since',str(int(time.time())),
                         '--filter','container='+authority.name,'--format','{{json .}}'],stdout=event_log,stderr=subprocess.STDOUT)
+        require_unheld()
         stamp = now()
         status.update(phase='running',start_time=stamp.isoformat(),
                       expected_end=(stamp+datetime.timedelta(hours=72) if args.soak else stamp+datetime.timedelta(minutes=30)).isoformat(),
@@ -292,13 +300,14 @@ while True:
                    str(evidence/'clock'),'--utc-reference-command',str(args.reference),
                    '--pause-command',shlex.join([sys.executable,str(pathlib.Path(__file__).resolve()),'--driver',address]),
                    '--admission-evidence',str(evidence/'admission.json'),
-                   '--stop-file',str(stop),'--invalid-file',str(evidence/'INVALID.json'),'--run-id',run_id,'--hold-file',str(hold),'--owner-pid',str(os.getpid()),'--owner-status',str(evidence/'status.json'),'--probe-control-path',str(state/'clock-probe.sock')]
+                   '--stop-file',str(stop),'--invalid-file',str(evidence/'INVALID.json'),'--run-id',run_id,'--owner-pid',str(os.getpid()),'--owner-status',str(evidence/'status.json'),'--probe-control-path',str(state/'clock-probe.sock')]
+        if not args.soak: command += ['--hold-file',str(hold)]
         command += ['--soak'] if args.soak else ['--seconds','1800','--dry-run']
         with (evidence/'harness.log').open('w') as log:
             process = subprocess.Popen(command,stdout=log,stderr=subprocess.STDOUT)
             status['harness_pid']=process.pid
             while process.poll() is None:
-                if hold.exists():
+                if running_hold(hold,args.soak):
                     stop.touch();closing.set()
                     record_invalid(evidence/'INVALID.json',dict(run_id=run_id,error='Coordinator HOLD stops native qualification',observed_ns=time.monotonic_ns()))
                     process.terminate()  # This exact sampler owns the load stdin.
@@ -343,7 +352,7 @@ while True:
                 atomic(evidence/'status.json',status)
                 write_status(evidence,status,f"Phase: {status['phase']}; run: {run_id}.\nOwner PID: {os.getpid()}; caffeinate PID: {caffeinate.pid}.\nStart: {status['start_time']}; expected end: {status['expected_end']}.\nUpdated: {status['updated']}.\nSee status.json and clock/progress.json for evidence.\nCoordinator request: {status.get('coordinator_request','none')}.\n")
                 closing.wait(5)
-            if hold.exists(): raise RuntimeError('HOLD active at completion; container cleanup deferred')
+            if running_hold(hold,args.soak): raise RuntimeError('HOLD active at completion; container cleanup deferred')
             status['continuity']=continuity.check(False)
             assert process.returncode == 0, f'harness exited {process.returncode}'
         status['result']=json.loads((evidence/'clock/result.json').read_text())
