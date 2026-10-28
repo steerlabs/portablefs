@@ -139,7 +139,7 @@ func TestCreatePreservesCompleteDirectoryOnlyWithAcceptedMember(t *testing.T) {
 }
 
 func TestCompleteDirectoryPeerAndColdWithdrawalRemoveAbsenceProof(t *testing.T) {
-	for _, kind := range []string{"name", "enumeration", "cold", "source"} {
+	for _, kind := range []string{"name", "enumeration", "attributes", "cold", "source", "source-attributes"} {
 		t.Run(kind, func(t *testing.T) {
 			raw, _, dir, unique := completeDirectoryFixture(t)
 			completeTestReply(t, raw, unique, fuse.OK)
@@ -152,12 +152,22 @@ func TestCompleteDirectoryPeerAndColdWithdrawalRemoveAbsenceProof(t *testing.T) 
 				if err := raw.invalidateCacheCoordinate(publicationCoordinate{kind: publicationItemEnumeration, item: dir.identity}, nil); err != nil {
 					t.Fatal(err)
 				}
+			case "attributes":
+				if err := raw.invalidateCacheCoordinate(publicationCoordinate{kind: publicationItemAttributes, item: dir.identity}, nil); err != nil {
+					t.Fatal(err)
+				}
 			case "cold":
 				if err := raw.invalidateAllCaches(context.Background()); err != nil {
 					t.Fatal(err)
 				}
-			case "source":
-				gate, err := namespaceSourceGate(dir.node.item, "unseen", false)
+			case "source", "source-attributes":
+				var gate *sourcePublicationGate
+				var err error
+				if kind == "source-attributes" {
+					gate, err = itemSourceGate(dir.node.item, false)
+				} else {
+					gate, err = namespaceSourceGate(dir.node.item, "unseen", false)
+				}
 				if err != nil {
 					t.Fatal(err)
 				}

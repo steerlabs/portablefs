@@ -52,6 +52,11 @@ func TestKernelReusableDirectoryReadPermissionAndRetainedRights(t *testing.T) {
 				t.Fatal(err)
 			}
 			defer func() { _ = os.Chmod(directoryA, 0700) }()
+			for _, directory := range []string{directoryA, directoryB} {
+				if _, lookupErr := os.Stat(filepath.Join(directory, "unseen")); !errors.Is(lookupErr, syscall.EACCES) {
+					t.Fatalf("search-denied missing lookup %s: %v", directory, lookupErr)
+				}
+			}
 			if fresh, openErr := os.Open(directoryB); openErr == nil {
 				fresh.Close()
 				t.Fatal("new open survived revoked read/search access")

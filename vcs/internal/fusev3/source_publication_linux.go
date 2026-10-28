@@ -612,6 +612,12 @@ func (l *sourcePublicationLease) markCallbackPublicationReady(ctx context.Contex
 	var directories []*dirHandle
 	for coordinate := range l.coordinates {
 		if coordinate.kind == publicationItemAttributes || coordinate.kind == publicationItemData {
+			// An empty MKDIR proof also grants negative lookup admission.
+			// Permission changes must retire it, just as a peer attribute
+			// withdrawal does. Only a proven local addition preserves its set.
+			if coordinate.item != l.completeParent || l.r.completeDirectories[coordinate.item] != l.completeProof {
+				l.r.dropCompleteDirectoryLocked(coordinate.item)
+			}
 			l.r.retireDirectoryBackingLocked(l.r.directories.proofs[coordinate.item])
 			delete(l.r.cachedAttrs, coordinate.item)
 			delete(l.r.cachedAttrPayloads, coordinate.item)
