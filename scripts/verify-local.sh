@@ -134,6 +134,8 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_macos27_kernel_cache_observer.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_writeback_probes.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_qualify_linux_workspace_clock.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_g3_support.py
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_linux_workspace_rtc_inject.py
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_linux_workspace_native_pressure.py
 go -C scripts/nts-reference test -race ./...
 go -C scripts/nts-reference vet ./...
 

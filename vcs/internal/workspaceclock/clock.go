@@ -189,7 +189,7 @@ func (o *Owner) Measure() (m Measurement, err error) {
 	m.Generation = g
 	rtc, e := o.backend.ReadUTC()
 	if e != nil {
-		return m, fmt.Errorf("%w: RTC read", ErrUnavailable)
+		return m, fmt.Errorf("%w: RTC read: %w", ErrUnavailable, e)
 	}
 	if rtc.IsZero() || rtc.Nanosecond() != 0 || rtc.Year() < 2020 || rtc.Year() > 2100 {
 		return m, fmt.Errorf("%w: malformed RTC UTC", ErrUnavailable)

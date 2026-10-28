@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"sort"
 	"sync"
@@ -554,7 +555,7 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 		if err != nil {
 			if errors.Is(err, permissionclock.ErrUnavailable) {
 				s.mu.Lock()
-				s.closeRTCIntervalLocked()
+				s.closeRTCIntervalLocked(err)
 				s.mu.Unlock()
 				return fmt.Errorf("%w: subscribe RTC evidence", errSubscriptionExpired)
 			}
@@ -616,8 +617,13 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 				s.config.beforeWorkspaceInstall()
 			}
 			if s.mount != nil && s.mount.workspaceRTC != nil {
-				if permission.Horizon != time.Duration(horizonNanos) || permission.Remaining(s.config.clock.Now(), s.mount.workspaceRTC, s.config.withdrawalLead) <= 0 {
-					s.closeRTCIntervalLocked()
+				if permission.Horizon != time.Duration(horizonNanos) {
+					s.closeRTCIntervalLocked(errors.New("subscribe RTC horizon mismatch"))
+					s.mu.Unlock()
+					return errSubscriptionExpired
+				}
+				if remaining, cause := permission.RemainingWithCause(s.config.clock.Now(), s.mount.workspaceRTC, s.config.withdrawalLead); remaining <= 0 {
+					s.closeRTCIntervalLocked(cause)
 					s.mu.Unlock()
 					return errSubscriptionExpired
 				}
@@ -647,6 +653,9 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 			s.lastChangeSeen = 0
 			s.lastChangeAck = 0
 			s.signalHorizonChangedLocked()
+			if s.mount != nil && s.mount.workspaceRTC != nil {
+				log.Printf("portablefs: workspace cache permission installed incarnation=%d boot_anchor_ns=%d rtc_anchor=%s horizon_ns=%d lead_ns=%d", incarnation, permission.Started.UnixNano(), permission.RTC.Format(time.RFC3339), permission.Horizon, s.config.withdrawalLead)
+			}
 			s.mu.Unlock()
 			if s.control != nil {
 				s.control.SetIncarnation(incarnation)
@@ -1225,7 +1234,7 @@ func (s *subscriptionRegistry) renewLoop(ctx context.Context, incarnation uint64
 			if s.mount != nil && s.mount.workspaceRTC != nil && errors.Is(err, permissionclock.ErrUnavailable) {
 				s.mu.Lock()
 				if s.incarnation == incarnation {
-					s.closeRTCIntervalLocked()
+					s.closeRTCIntervalLocked(err)
 				}
 				s.mu.Unlock()
 				return errSubscriptionExpired
@@ -1262,9 +1271,11 @@ func (s *subscriptionRegistry) acceptRenewal(incarnation uint64, candidate permi
 	if !now.Before(s.cacheUntil) || !cacheUntil.After(now) {
 		return false
 	}
-	if s.mount != nil && s.mount.workspaceRTC != nil && candidate.Remaining(s.config.clock.Now(), s.mount.workspaceRTC, s.config.withdrawalLead) <= 0 {
-		s.closeRTCIntervalLocked()
-		return false
+	if s.mount != nil && s.mount.workspaceRTC != nil {
+		if remaining, cause := candidate.RemainingWithCause(s.config.clock.Now(), s.mount.workspaceRTC, s.config.withdrawalLead); remaining <= 0 {
+			s.closeRTCIntervalLocked(cause)
+			return false
+		}
 	}
 	if s.mount != nil && s.mount.workspaceRTC != nil && (s.workspaceProof == nil ||
 		s.mount.workspace.Recover(*s.workspaceProof) != nil && !s.mount.workspace.Installed(*s.workspaceProof)) {
@@ -1646,19 +1657,20 @@ func (s *subscriptionRegistry) permissionRemainingLocked(lead time.Duration) tim
 	if s.rtcClosed {
 		return 0
 	}
-	remaining := s.permission.Remaining(s.config.clock.Now(), s.mount.workspaceRTC, lead)
+	remaining, cause := s.permission.RemainingWithCause(s.config.clock.Now(), s.mount.workspaceRTC, lead)
 	if s.config.afterWorkspaceSample != nil {
 		s.config.afterWorkspaceSample()
 	}
 	if remaining <= 0 {
-		s.closeRTCIntervalLocked()
+		s.closeRTCIntervalLocked(cause)
 	}
 	return remaining
 }
 
 // The caller owns only the local use lock. Closure never joins workers or
 // reenters lifecycle/manager locks. A late successful sample cannot clear it.
-func (s *subscriptionRegistry) closeRTCIntervalLocked() {
+func (s *subscriptionRegistry) closeRTCIntervalLocked(causes ...error) {
+	first := !s.rtcClosed
 	if s.mount != nil && s.mount.workspaceRTC != nil {
 		s.rtcClosed = true
 	}
@@ -1666,6 +1678,9 @@ func (s *subscriptionRegistry) closeRTCIntervalLocked() {
 		s.active = false
 		s.generation++
 		s.signalHorizonChangedLocked()
+	}
+	if first && len(causes) != 0 && causes[0] != nil {
+		log.Printf("portablefs: workspace cache permission closed incarnation=%d boot_anchor_ns=%d rtc_anchor=%s horizon_ns=%d lead_ns=%d closed_boot_ns=%d: %v", s.incarnation, s.permission.Started.UnixNano(), s.permission.RTC.Format(time.RFC3339), s.permission.Horizon, s.config.withdrawalLead, s.config.clock.Now().UnixNano(), causes[0])
 	}
 }
 

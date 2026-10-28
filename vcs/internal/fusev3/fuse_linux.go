@@ -1627,6 +1627,11 @@ func (m *Mount) callMutation(ctx context.Context, request *authoritypb.Request, 
 		return nil, errors.New("fusev3: mutation has no subscription registry")
 	}
 	if (requiresGate || request.GetLookup() != nil) && m.subscription.stamp() == (subscriptionStamp{}) {
+		// A managed callback can outlive its serving permit while waiting for
+		// RPC capacity. Preserve that definite refusal before errno conversion.
+		if err := workspaceAcceptance(ctx); err != nil {
+			return nil, err
+		}
 		return nil, syscall.EIO
 	}
 	callback, _ := ctx.Value(mutationCallbackKey{}).(*mutationCallback)
@@ -1791,6 +1796,13 @@ func (n *node) mutate(parent context.Context, request *authoritypb.Request) (*au
 }
 
 func (n *node) mutateWithSource(parent context.Context, request *authoritypb.Request, gate *sourcePublicationGate) (*authoritypb.Response, syscall.Errno) {
+	return n.mutateWithSourceAdmission(parent, request, gate, nil)
+}
+
+// Preserve a definite admission refusal before errno conversion. A managed
+// direct WRITE can retire that attempt and wait outside the cold cohort only
+// when no request was assigned; an authoritative or uncertain result cannot.
+func (n *node) mutateWithSourceAdmission(parent context.Context, request *authoritypb.Request, gate *sourcePublicationGate, unaccepted *bool) (*authoritypb.Response, syscall.Errno) {
 	if n.stale.Load() && (n.epochStale.Load() || request.GetClose() == nil) {
 		return nil, syscall.EIO
 	}
@@ -1805,6 +1817,11 @@ func (n *node) mutateWithSource(parent context.Context, request *authoritypb.Req
 	captureServedVersion(parent, response)
 	if retainErr := n.mount.retainMutationPostState(parent, response); retainErr != nil {
 		return response, syscall.ENOTCONN
+	}
+	if unaccepted != nil {
+		p := replyPublicationFromContext(parent)
+		*unaccepted = n.mount.workspace != nil && response == nil && err == workspaceadmission.ErrClosed &&
+			p != nil && (p.source == nil || !p.source.isAssigned())
 	}
 
 	return response, rpcErrno(response, err)

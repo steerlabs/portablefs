@@ -9,6 +9,7 @@ import shlex
 import subprocess
 import time
 import uuid
+from linux_workspace_native_hold import hold_between_cases
 
 
 class NativeAuthority:
@@ -378,6 +379,7 @@ print(json.dumps({'closed':True,'close_error':close_error}),flush=True)
         return old, fresh
 
     def close(self):
+        hold_between_cases()
         if not getattr(self, 'name', None):
             return
         logs = subprocess.run(['docker', 'logs', self.name], capture_output=True, text=True)

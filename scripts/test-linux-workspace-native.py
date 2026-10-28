@@ -4,20 +4,22 @@ import hashlib
 import os
 import datetime
 import pathlib
-import queue
 import subprocess
 import sys
-import threading
 import time
 import uuid
 import tempfile
 import re
 import shutil
-import signal
 from linux_workspace_native_managed import NativeAuthority
 from linux_workspace_native_lifecycle import lifecycle_checks
 from linux_workspace_native_product import product_checks
 from linux_workspace_native_g0 import pause_checks
+from linux_workspace_native_ssh import SSHJobs
+from linux_workspace_native_reads import read_checks
+from linux_workspace_native_guest import native_guest_class
+from linux_workspace_native_hold import hold_between_cases
+from linux_workspace_native_16k import userspace_checks
 
 binary, image, evidence, inventory, *options = sys.argv[1:]
 assert options in ([], ['--defer-ui']), options
@@ -38,6 +40,7 @@ def record(name):
     assert name in required and name not in passed, name
     passed.append(name)
     print('PASS:', name, flush=True)
+    hold_between_cases(restart_on_release=True)
 
 
 def defer_case(name):
@@ -46,72 +49,7 @@ def defer_case(name):
     print('NOT RUN (UI deferred):', name, flush=True)
 
 
-class Guest:
-    def __init__(self):
-        self.lines = queue.Queue()
-        self.history = []
-        self.stderr = (root / ('owner-' + str(len(measurements)) + '.stderr')).open('w')
-        self.p = subprocess.Popen([binary, image, str(state)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=self.stderr, text=True, bufsize=1)
-
-        def read():
-            for line in self.p.stdout:
-                assert events.tell() + len(line) <= 8*1024*1024, 'event log bound exceeded'
-                events.write(line); events.flush()
-                self.lines.put(json.loads(line))
-            self.lines.put({'event': 'eof', 'returncode': self.p.wait()})
-
-        threading.Thread(target=read, daemon=True).start()
-        try:
-            self.starting = self.wait('starting')
-            self.ready = self.wait('ready')
-        except BaseException:
-            self.cleanup()
-            raise
-        measurements.append({'boot_ns': self.ready['boot_ns'], 'pid': self.starting['pid']})
-
-    def wait(self, expected, timeout=180):
-        deadline = time.monotonic() + timeout
-        while True:
-            value = self.lines.get(timeout=max(0.01, deadline - time.monotonic()))
-            self.history.append(value)
-            if value['event'] in (expected if isinstance(expected, tuple) else (expected,)):
-                return value
-            if value['event'] in ('failure', 'eof'):
-                raise RuntimeError(value)
-
-    def command(self, name, **fields):
-        self.p.stdin.write(json.dumps({'command': name, **fields}) + '\n'); self.p.stdin.flush()
-
-    def discard(self):
-        self.command('discard')
-        value = self.wait('stopped', 30)
-        assert value['operations'][-1] == 'stop-completed', value
-        assert self.p.wait(timeout=10) == 0
-        self.stderr.close()
-
-    def ssh(self, command):
-        result = subprocess.run(['/usr/bin/ssh', '-F', self.ready['ssh_config'], 'portablefs-workspace', command],
-                                text=True, capture_output=True, timeout=30)
-        assert result.returncode == 0, (command, result.returncode, result.stderr, result.stdout)
-        return result.stdout.strip()
-
-    def stop(self, interrupt=False):
-        self.ssh('sync')
-        if interrupt: self.p.send_signal(signal.SIGINT)
-        else: self.command('stop')
-        value = self.wait('stopped', 30)
-        assert value['operations'][-1] == 'shutdown-completed'
-        assert self.p.wait(timeout=10) == 0
-        self.stderr.close()
-
-    def cleanup(self):
-        if self.p.poll() is None:
-            self.command('stop')
-            try:
-                self.p.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                self.p.terminate(); self.p.wait(timeout=10)
+Guest = native_guest_class(binary, image, root, state, events, measurements)
 
 
 guest = None
@@ -172,6 +110,11 @@ try:
     assert fuse['negotiated_major'] == 7 and fuse['negotiated_minor'] >= 31 and fuse['initialized'] is True
     measurements[-1]['fuse'] = fuse
     record('fuse-init-7.31')
+    assert guest.ssh('getconf PAGESIZE') == '16384'
+    assert guest.ssh('uname -r') == json.loads((pathlib.Path(image) / 'image-inputs.json').read_text())['lock']['kernel_release']
+    assert 'oops=panic' in guest.ssh('cat /proc/cmdline').split()
+    assert guest.ssh('cat /proc/sys/kernel/panic_on_oops') == '1'
+    record('guest-16k-page-size')
     assert guest.ssh('id -u; id -g; whoami').splitlines() == ['1000', '1000', 'workspace']
     assert guest.ssh("set -e; command -v python3 git cc; python3 -c 'print(6*7)'; git --version; cc --version").splitlines()[3] == '42'
     toolchain = guest.ssh('set -e; node --version; npm --version; python3 -m pip --version; '
@@ -232,7 +175,7 @@ try:
     before = json.loads(guest.ssh('cat /run/portablefs-workspace/clock.json'))
     assert before['generation'] == 0 and before['sample_age_ns'] <= 250_000_000
     record('rtc-boot-correction')
-    clock_arguments = ['--seconds', '1800', '--dry-run'] if os.environ.get('PFS_NATIVE_CLOCK_DRY_RUN') == '1' else ['--seconds', '65']
+    clock_arguments = ['--seconds', '1800', '--dry-run'] if os.environ.get('PFS_NATIVE_CLOCK_DRY_RUN') == '1' else ['--seconds', '60']
     subprocess.run([sys.executable, str(pathlib.Path(__file__).with_name('qualify-linux-workspace-clock.py')), image, guest.ready['ssh_config'], str(root/'clock-qualification'), *clock_arguments], check=True)
     record('rtc-awake-measurement')
     authority = NativeAuthority(root)
@@ -242,6 +185,8 @@ try:
     authority.initial_io(guest)
     record('managed-write-read-fsync')
     record('managed-peer-coherence')
+    read_checks(authority, guest, root / 'read-stress', record,
+                stress_work=lambda: userspace_checks(guest, root / 'userspace-16k', record))
     managed = pause_checks(authority, guest, managed, record)
     token = uuid.uuid4().hex
     guest.ssh("printf '%s\\n' '" + token + "' > ~/persistence; sync -f ~/persistence")
@@ -328,8 +273,10 @@ try:
     fingerprint = subprocess.check_output(['/usr/bin/ssh-keygen', '-lf', str(state/'guest_host_key.pub')], text=True).split()[1]
     assert debug.returncode == 0 and 'Server host key: ssh-ed25519 ' + fingerprint in debug.stderr
     record('guest-host-key-persistence')
+    ssh_jobs = SSHJobs(guest.ssh, root / 'ssh-jobs', record)
     guest.stop(interrupt=True)
     guest = Guest()
+    ssh_jobs.check_shutdown(guest.ssh)
     root_death_mount = authority.mount(guest)
     guest.command('pause'); guest.wait('paused', 25)
     guest.command('resume'); guest.wait('resumed', 25)
@@ -344,6 +291,7 @@ try:
     stopped = guest.wait('stopped', 25)
     assert stopped['operations'][-1] == 'stop-completed', stopped
     assert guest.p.wait(timeout=10) == 1
+    guest.finish()
     record('resume-single-use')
     record('managed-root-owner-death-vm-discard')
     guest = Guest()
@@ -352,10 +300,23 @@ try:
     stopped = guest.wait('stopped', 30)
     assert stopped['operations'][-1] == 'shutdown-completed'
     assert guest.p.wait(timeout=10) == 0
+    guest.finish()
     record('clean-stop')
     product_checks(image, root / "product", record, authority=authority, defer_ui=defer_ui, defer_case=defer_case)
     product_checks(image, root / "product-removal", record, authority=authority, outcome_case='removal', defer_ui=defer_ui, defer_case=defer_case)
     product_checks(image, root / "product-loss", record, authority=authority, outcome_case='loss', defer_ui=True, defer_case=lambda name: None)
+    product_checks(image, root / "product-panic", record, authority=authority, outcome_case='panic', defer_ui=True, defer_case=lambda name: None)
+    diagnostic = re.compile(r'BUG:|Oops:|Kernel panic - not syncing:|bad rss-counter|non-zero pgtables_bytes|Unable to handle kernel|rcu:.*stall', re.I)
+    serial_checks = []
+    for serial in sorted(root.rglob('*serial.log')):
+        if serial == root / 'product-panic/panic-serial.log': continue
+        hits = [line for line in serial.read_text(errors='replace').splitlines() if diagnostic.search(line)]
+        serial_checks.append({'path': str(serial.relative_to(root)), 'unexpected_diagnostics': hits})
+    (root / 'kernel-diagnostics.json').write_text(json.dumps(serial_checks, indent=2) + '\n')
+    assert serial_checks and all(not check['unexpected_diagnostics'] for check in serial_checks), serial_checks
+    pressure = [json.loads(line) for line in (root / 'host-memory-pressure.jsonl').read_text().splitlines()]
+    assert {'start', 'interval', 'end'} <= {row['phase'] for row in pressure}
+    assert any('vm' in row for row in pressure), 'missing owned VM compressed-memory evidence'
     assert sorted(passed + not_run) == sorted(required), (passed, not_run, required)
     (root / 'results.json').write_text(json.dumps({'required': required, 'passed': passed, 'notRun': not_run, 'qualified': not not_run, 'measurements': measurements, 'state': str(state), 'image_manifest_sha256': hashlib.sha256((pathlib.Path(image)/'manifest.json').read_bytes()).hexdigest(), 'rtc_admission': 'pass', 'utc': 'inconclusive', 'g0': 'inconclusive', 'first_read_after_resume': True, 'concurrent_duplicate_readers': True}, indent=2) + '\n')
     if not_run:

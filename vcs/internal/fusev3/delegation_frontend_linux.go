@@ -97,6 +97,9 @@ func (n *node) ensureWriteDelegation(ctx context.Context, handle *fileHandle) er
 			return err
 		}
 		if !n.mount.workspaceServing() {
+			if err := workspaceAcceptance(ctx); err != nil {
+				return err
+			}
 			return syscall.EIO
 		}
 		response, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Item: cloneBytes(n.item.GetToken()), Flags: &authoritypb.OpenFlags{Write: true}, WriteIntent: true}}})
