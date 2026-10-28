@@ -543,6 +543,10 @@ print(json.dumps({'fsync_errno':fsync_error,'close_errno':close_error}),flush=Tr
             record('service-crash-reconcile-unknown-retained')
             if outcome_case == 'panic':
                 assert settled['someChangesWereNotSaved'], settled
+                # Main persists exact retired pages append-only before ACK; a
+                # fresh boot cannot rewrite them. docs/linux-workspace.md:
+                # 'preserving prior outcomes' and 'A subsequent clean boot
+                # does not erase that earlier uncertainty.'
                 assert set(failed['retainedEvidence']) <= set(settled['retainedEvidence']), settled
                 record('service-panic-outcomes-retained')
         retained_reason = 'Some changes were not saved' if outcome_case == 'panic' else 'Previous write outcome unknown'

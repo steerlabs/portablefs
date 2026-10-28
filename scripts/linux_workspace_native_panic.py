@@ -20,6 +20,9 @@ ExecStart=/bin/sh -c 'while ! test -f /home/workspace/.pfs-native-panic; do slee
 '''
     with tempfile.TemporaryDirectory(prefix='panic-fixture-', dir=evidence) as temporary:
         temporary = pathlib.Path(temporary)
+        # The product clone can be under /private/tmp, outside Docker's shared
+        # paths. Stage only its disposable disk in the evidence directory.
+        subprocess.run(['/bin/cp', '-c', str(image / 'system.ext4'), str(temporary / 'system.ext4')], check=True)
         (temporary / 'panic.service').write_text(unit)
         (temporary / 'commands').write_text(
             'write /fixture/panic.service /etc/systemd/system/pfs-native-panic.service\n'
@@ -29,15 +32,15 @@ printf 'deb [check-valid-until=no] http://snapshot.debian.org/archive/debian/202
 rm -f /etc/apt/sources.list.d/*
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends e2fsprogs
-debugfs -w -f /fixture/commands /image/system.ext4
-debugfs -R 'stat /etc/systemd/system/pfs-native-panic.service' /image/system.ext4
-debugfs -R 'stat /etc/systemd/system/multi-user.target.wants/pfs-native-panic.service' /image/system.ext4
+debugfs -w -f /fixture/commands /fixture/system.ext4
+debugfs -R 'stat /etc/systemd/system/pfs-native-panic.service' /fixture/system.ext4
+debugfs -R 'stat /etc/systemd/system/multi-user.target.wants/pfs-native-panic.service' /fixture/system.ext4
 ''')
         builder = json.loads((image / 'image-inputs.json').read_text())['lock']['builder']
         name = 'pfs-16k-panic-fixture-' + uuid.uuid4().hex[:10]
         try:
             result = subprocess.run(['docker', 'run', '--name', name, '--memory', '512m', '--cpus', '1',
-                '-v', str(image.resolve()) + ':/image', '-v', str(temporary.resolve()) + ':/fixture:ro',
+                '-v', str(temporary.resolve()) + ':/fixture',
                 builder, 'bash', '/fixture/install.sh'],
                 text=True, capture_output=True, timeout=180)
             (evidence / 'panic-fixture.log').write_text(result.stdout + result.stderr)
@@ -45,6 +48,7 @@ debugfs -R 'stat /etc/systemd/system/multi-user.target.wants/pfs-native-panic.se
             assert 'Type: regular' in result.stdout and 'Type: symlink' in result.stdout, result
         finally:
             subprocess.run(['docker', 'rm', '-f', name], capture_output=True, check=False, timeout=30)
+        subprocess.run(['/bin/cp', '-c', str(temporary / 'system.ext4'), str(image / 'system.ext4')], check=True)
     h = hashlib.sha256()
     with (image / 'system.ext4').open('rb') as disk:
         for block in iter(lambda: disk.read(4 << 20), b''): h.update(block)

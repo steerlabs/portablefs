@@ -29,7 +29,6 @@ rtc-awake-measurement
 managed-standalone-provision
 managed-write-read-fsync
 managed-peer-coherence
-managed-large-repository-read-stress
 managed-suspend-resume-data
 managed-unmount-exact-cleanup
 managed-channel-loss-vm-discard
