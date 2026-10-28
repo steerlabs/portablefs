@@ -611,15 +611,29 @@ func TestDirectoryCacheUnwrittenOpenReleasesOnlyItsLocalReference(t *testing.T) 
 				t.Fatalf("prepare=%v/%v", status, lifecycle)
 			}
 			completeTestReply(t, f.raw, u, fuse.EIO)
-			if f.raw.handles[opened.Fh] != nil || len(f.raw.cacheReservations) != 0 {
+			if !f.mount.isRevoked() {
+				t.Fatal("physical reply failure did not close serving admission")
+			}
+			// A lost physical reply starts asynchronous terminal withdrawal.
+			// Join it before inspecting ownership: a previously warm proof is
+			// retired by that boundary, while the older application reference
+			// remains independent of the failed OPEN's reference.
+			_ = f.mount.Close()
+			f.raw.mu.RLock()
+			orphan := f.raw.handles[opened.Fh] != nil
+			reservations := len(f.raw.cacheReservations)
+			refs, cached := handle.backing.refs, handle.backing.cached
+			terminal := f.raw.replyTerminal
+			f.raw.mu.RUnlock()
+			if orphan || reservations != 0 {
 				t.Fatal("unwritten OPEN retained its local handle or reservation")
 			}
 			wantRefs := 0
 			if warm {
 				wantRefs = 1
 			}
-			if handle.backing.refs != wantRefs || handle.backing.cached != warm {
-				t.Fatalf("backing refs=%d cached=%v, want refs=%d cached=%v", handle.backing.refs, handle.backing.cached, wantRefs, warm)
+			if !terminal || refs != wantRefs || cached {
+				t.Fatalf("terminal=%v backing refs=%d cached=%v, want terminal with refs=%d and no cache proof", terminal, refs, cached, wantRefs)
 			}
 		})
 	}
