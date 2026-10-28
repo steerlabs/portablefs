@@ -10,12 +10,20 @@ private func mainStoreDirectory() throws -> URL {
 }
 private func mainJobPages() throws -> [Data] {
     var frame = try WorkspaceControl.decode(workspaceGolden("status_reply"))
-    let mount = try #require(frame.statusReply.mounts.first?.mount)
+    let template = try #require(frame.statusReply.mounts.first?.mount)
     var status = frame.statusReply; status.mounts = []; status.jobs = []; status.retired = []
     return try (1...128).map { index in
-        var job = WorkspaceMountJob(); job.mount = mount; job.requestID = UInt64(index)
-        job.operation = index % 2 == 0 ? "mount" : "provision"; job.phase = "complete"
-        var retired = WorkspaceRetiredOutcome(); retired.retirementSequence = UInt64(index); retired.job = job
+        var mount = template; mount.incarnation = Data(repeating: UInt8((index + 1) / 2), count: 16)
+        var retired = WorkspaceRetiredOutcome(); retired.retirementSequence = UInt64(index)
+        if index % 2 == 1 {
+            var job = WorkspaceMountJob(); job.mount = mount; job.requestID = UInt64((index + 1) / 2)
+            job.operation = "umount"; job.phase = "complete"; retired.job = job
+        } else {
+            var resolved = WorkspaceMountStatus(); resolved.mount = mount; resolved.state = "terminal"
+            resolved.reason = "unmounted"; resolved.cleanup = "complete"; resolved.renewal.state = "not-required"
+            resolved.outcome.durability = "durable"; resolved.outcome.observation = "observed"; resolved.outcome.release = "released"
+            retired.mountStatus = resolved
+        }
         status.retired = [retired]; frame.statusReply = status
         return try WorkspaceControl.encode(frame)
     }

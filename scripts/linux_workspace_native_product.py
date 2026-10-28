@@ -208,7 +208,7 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
             recovered=json.loads((home/'.local/state/portablefs/workspace/desired.json').read_text())
             assert recovered['version']==3 and not recovered['retained'],recovered
             assert not status()['retainedEvidence'] and not status()['outcomes']
-            (evidence/'main-overfull-recovery.json').write_text(json.dumps({'legacy_job_pages':128,'legacy_mount_incarnations':64,'retained_after_recovery':len(recovered['retained']),'published_version':recovered['version']},indent=2))
+            (evidence/'main-overfull-recovery.json').write_text(json.dumps({'legacy_retirement_records':128,'legacy_ordinary_jobs':64,'legacy_mount_incarnations':64,'retained_after_recovery':len(recovered['retained']),'published_version':recovered['version']},indent=2))
         assert json.loads(app_command('--workspace-api','status').stdout)['state']=='stopped'
         record('service-app-api-client')
         subprocess.run([str(host),'--abandon-workspace-test-request'],env=env,check=True)

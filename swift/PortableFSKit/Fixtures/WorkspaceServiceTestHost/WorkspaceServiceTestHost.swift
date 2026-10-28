@@ -52,9 +52,16 @@ import SwiftUI
                 for index in 1...128 {
                     var mount = WorkspaceMountID(); mount.authorityID = Data(repeating: 4, count: 32); mount.volumeID = "old-clean"
                     mount.incarnation = Data(repeating: UInt8((index + 1) / 2), count: 16)
-                    var job = WorkspaceMountJob(); job.mount = mount; job.requestID = UInt64(index)
-                    job.operation = index % 2 == 0 ? "mount" : "provision"; job.phase = "complete"
-                    var retired = WorkspaceRetiredOutcome(); retired.retirementSequence = UInt64(index); retired.job = job
+                    var retired = WorkspaceRetiredOutcome(); retired.retirementSequence = UInt64(index)
+                    if index % 2 == 1 {
+                        var job = WorkspaceMountJob(); job.mount = mount; job.requestID = UInt64((index + 1) / 2)
+                        job.operation = "umount"; job.phase = "complete"; retired.job = job
+                    } else {
+                        var resolved = WorkspaceMountStatus(); resolved.mount = mount; resolved.state = "terminal"
+                        resolved.reason = "unmounted"; resolved.cleanup = "complete"; resolved.renewal.state = "not-required"
+                        resolved.outcome.durability = "durable"; resolved.outcome.observation = "observed"; resolved.outcome.release = "released"
+                        retired.mountStatus = resolved
+                    }
                     status.retired = [retired]
                     var frame = WorkspaceEnvelope(); frame.version = 8; frame.requestID = 1; frame.statusReply = status
                     pages.append(try WorkspaceControl.encode(frame).base64EncodedString())
@@ -64,7 +71,7 @@ import SwiftUI
                     let file = directory.appendingPathComponent(name); try data.write(to: file, options: .atomic)
                     guard chmod(file.path, 0o600) == 0 else { exit(1) }
                 }
-                print("128 retired job pages across 64 mount incarnations, plus current snapshot"); exit(0)
+                print("64 ordinary jobs and 64 clean mount outcomes, plus current snapshot"); exit(0)
             case ["--unregister-workspace-test"]:
                 let service = SMAppService.agent(plistName: id + ".workspace.plist")
                 if service.status != .notRegistered && service.status != .notFound { try await service.unregister() }
