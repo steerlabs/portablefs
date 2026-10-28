@@ -150,7 +150,6 @@ github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOrdinaryQuotaExhaustionI
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOrdinaryRecoverableUncertainRename
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOrdinaryDelayedLookupCannotRestorePreRenameBinding
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestOrdinaryPeerReplacementBeforeSourceDispatch
-
 # Reusable directory proofs preserve access checks and retained handle rights.
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestKernelReusableDirectoryReadPermissionAndRetainedRights
 github.com/steerlabs/portablefs/vcs/internal/fusev3:TestDirectoryCacheSourceRetirementDefersQueueWaitBeyondCallbackFence
