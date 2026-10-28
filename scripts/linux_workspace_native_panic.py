@@ -53,4 +53,4 @@ debugfs -R 'stat /etc/systemd/system/multi-user.target.wants/pfs-native-panic.se
     (image / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     (evidence / 'panic-fixture.json').write_text(json.dumps({
         'original_manifest': original, 'fixture_manifest': manifest,
-        'root_service': unit, 'trigger': 'guest-only SysRq c (kernel BUG)'}, indent=2) + '\n')
+        'root_service': unit, 'trigger': 'guest-only SysRq c (kernel panic)'}, indent=2) + '\n')

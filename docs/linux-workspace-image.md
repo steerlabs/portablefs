@@ -78,7 +78,7 @@ recipe; notices cover the new binary package names.
 The guest command line includes `oops=panic panic=-1`: the first oops panics
 and immediately takes VZ's stop/reboot boundary. Host handling uses the existing
 unexpected-stop path, retains unknown/lost outcomes and requires a fresh boot;
-RAM is never adopted. The native panic case adds a root-only SysRq trigger to
+RAM is never adopted. The native panic case adds a root-only SysRq panic trigger to
 a disposable copy of the system disk, retaining the product kernel, initramfs
 and command line. That fixture is not a distributable image.
 

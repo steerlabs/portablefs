@@ -482,7 +482,7 @@ print(json.dumps({'fsync_errno':fsync_error,'close_errno':close_error}),flush=Tr
             shutil.copyfile(serial, evidence/'panic-serial.log')
             text = serial.read_text(errors='replace')
             assert 'sysrq: Trigger a crash' in text and 'Kernel panic - not syncing:' in text, text[-12000:]
-            assert 'Oops' in text and 'sysrq_handle_crash' in text, text[-12000:]
+            assert 'sysrq triggered crash' in text and 'sysrq_handle_crash' in text, text[-12000:]
             assert 'shutdown-completed' not in text
             assert failed['desiredRunning'] and failed['retainedEvidence'], failed
             assert failed['someChangesWereNotSaved'], failed
