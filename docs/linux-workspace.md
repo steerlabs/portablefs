@@ -567,8 +567,13 @@ by one second each plus integer quantization of less than one second.
 Entry, delegated acceptance after capacity waits, CONTROL/drain and physical
 reply preparation use that original interval. Encoded cache lifetimes cannot
 exceed its remaining permission, including finalized cached-arena replies.
-Invalid evidence, ioctl failure, backward RTC below the anchor and expiry close
-it synchronously. Successful reads and delayed renewal cannot reopen it; complete
+An `RTC_RD_TIME` interrupted with EINTR produced no sample and restarts on the
+same retained descriptor, without an attempt cap, deadline, backoff or signal
+masking. Only a fresh successful sample reaches the unchanged predicate and
+original anchors; time spent restarting receives no discount. Continued
+interruption can stall acquisition and makes no bounded-progress promise.
+Invalid evidence, any other ioctl errno, backward RTC below the anchor and
+expiry close permission synchronously. Successful reads and delayed renewal cannot reopen it; complete
 cold withdrawal and fresh permission in the accepted recovery generation must
 precede serving. Renewal checks the installed old interval before replacing it.
 Managed workspaces renew every second. Ordinary native mounts retain their
@@ -689,6 +694,15 @@ key. Install an app-owned include only through explicit setup, preserving
 unrelated SSH configuration. Qualify VS Code/Cursor, Zed and JetBrains Linux
 arm64 backends independently; local UI or AI networking does not establish that
 file tools execute in Linux.
+
+Public-key SSH uses Debian's PAM session stack and `pam_systemd` to place
+workspace processes in logind session scopes. Detached jobs remain in those
+scopes after disconnect; the workspace user's lingering manager and session
+bus also remain available. `/var` is volatile, so tmpfiles restores the linger
+marker at boot. The user manager waits for VM-bound bootstrap and the persistent
+home mount before loading user services. Ordinary VM shutdown still stops the
+session scopes and user manager. Password and keyboard-interactive authentication
+remain disabled.
 
 ## Guest artifact and boot path
 

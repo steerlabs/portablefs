@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -245,6 +246,14 @@ func (r rtcColdRPC) Subscribe(ctx context.Context, a, b []byte) (*authoritypb.Su
 	return reply, permissionclock.Permission{Time: started.Add(time.Duration(reply.HorizonNanos)), Started: started, RTC: sample, Horizon: time.Duration(reply.HorizonNanos)}, err
 }
 func TestWorkspaceRTCOnlyColdWithdrawalAndFreshPermissionClearLatch(t *testing.T) {
+	for _, cause := range []string{"read-failure", "acquisition-expiry", "acquisition-equality", "acquisition-backward"} {
+		t.Run(cause, func(t *testing.T) {
+			testWorkspaceRTCAcquisitionColdRecovery(t, cause)
+		})
+	}
+}
+
+func testWorkspaceRTCAcquisitionColdRecovery(t *testing.T, cause string) {
 	f, g, base := coldFixture(t)
 	s := f.mount.subscription
 	clock := &subscriptionTestClock{now: s.config.clock.Now()}
@@ -255,13 +264,37 @@ func TestWorkspaceRTCOnlyColdWithdrawalAndFreshPermissionClearLatch(t *testing.T
 	s.cacheUntil = clock.Now().Add(9 * time.Second)
 	s.permission = permissionclock.Permission{Time: s.horizon, Started: clock.Now(), RTC: rtc.anchor, Horizon: 10 * time.Second}
 	f.mount.rpc.(*epochRPC).rpc = rtcColdRPC{coldTestRPC: base, clock: clock, rtc: rtc}
-	rtc.failure.Store(true)
+	f.mount.workspaceRTC = &cutRTC{reader: rtc, before: func(n int) {
+		if n != 1 {
+			return
+		}
+		// Low-level syscall-sequence tests cover EINTR restart itself. Here a
+		// completed logical acquisition carries its delayed fresh sample into
+		// the real latch, renewal, withdrawal and recovery owners.
+		switch cause {
+		case "read-failure":
+			rtc.failure.Store(true)
+		case "acquisition-expiry":
+			clock.advance(10 * time.Second)
+			rtc.second.Store(10)
+		case "acquisition-equality":
+			rtc.second.Store(6)
+		case "acquisition-backward":
+			rtc.second.Store(-1)
+		}
+	}}
 	if f.mount.workspaceServing() {
-		t.Fatal("read failure served")
+		t.Fatal("failed acquisition served")
 	}
+	f.mount.workspaceRTC = rtc
 	rtc.failure.Store(false)
+	rtc.second.Store(0)
 	if f.mount.workspaceServing() {
 		t.Fatal("read success cleared latch")
+	}
+	candidate := permissionclock.Permission{Time: clock.Now().Add(10 * time.Second), Started: clock.Now(), RTC: rtc.anchor, Horizon: 10 * time.Second}
+	if s.acceptRenewal(s.incarnation, candidate) || !s.rtcClosed {
+		t.Fatal("delayed fresh renewal cleared latch")
 	}
 	serial := g.Close(1)
 	cold, err := f.mount.SuspendWorkspace(t.Context(), 1, serial, clock.Now().Add(5*time.Second))
@@ -385,6 +418,16 @@ func TestWorkspaceRTCRepeatedPausesAndBackwardCorrectionAboveAnchor(t *testing.T
 }
 
 func TestWorkspaceRTCRenewalSampleCannotInstallAcrossNewClose(t *testing.T) {
+	for _, sample := range []int{1, 2} {
+		for _, generation := range []uint64{1, 2} {
+			t.Run(fmt.Sprintf("sample-%d-generation-%d", sample, generation), func(t *testing.T) {
+				testWorkspaceRTCRenewalAcquisitionClose(t, sample, generation)
+			})
+		}
+	}
+}
+
+func testWorkspaceRTCRenewalAcquisitionClose(t *testing.T, sample int, generation uint64) {
 	f, clock, rtc := workspaceRTCFixture(t)
 	s := f.mount.subscription
 	// Recover the gate owner from this fixture's installed proof through a new
@@ -393,15 +436,18 @@ func TestWorkspaceRTCRenewalSampleCannotInstallAcrossNewClose(t *testing.T) {
 	clock.advance(time.Second)
 	rtc.second.Store(1)
 	old := s.permission
-	reader := &cutRTC{reader: rtc, inside: func(n int) {
-		if n == 2 {
-			gate.Close(2)
+	reader := &cutRTC{reader: rtc, before: func(n int) {
+		if n == sample {
+			gate.Close(generation)
 		}
 	}}
 	f.mount.workspaceRTC = reader
 	candidate := permissionclock.Permission{Time: clock.Now().Add(10 * time.Second), Started: clock.Now(), RTC: rtc.anchor.Add(time.Second), Horizon: 10 * time.Second}
 	if s.acceptRenewal(s.incarnation, candidate) || s.permission != old {
 		t.Fatal("obsolete candidate installed across host Close", reader.calls, s.permission)
+	}
+	if f.mount.workspaceServing() {
+		t.Fatal("successful acquisition reopened the closed generation")
 	}
 }
 

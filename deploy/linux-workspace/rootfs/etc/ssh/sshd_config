@@ -4,6 +4,7 @@ PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitRootLogin no
 AllowUsers workspace
-UsePAM no
+AuthenticationMethods publickey
+UsePAM yes
 PrintMotd no
 Subsystem sftp internal-sftp

@@ -2,6 +2,8 @@ package permissionclock
 
 import (
 	"errors"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -96,5 +98,42 @@ func TestInvalidEvidenceAndShortHorizons(t *testing.T) {
 	}
 	if p.Remaining(p.Started.Add(-time.Second), fixed(p.RTC), time.Second) != 0 {
 		t.Fatal("backward boottime admitted")
+	}
+}
+
+func TestDenialPreservesFailingSampleAndCause(t *testing.T) {
+	p := permission()
+	for _, tc := range []struct {
+		name, detail string
+		boot, rtc    time.Duration
+		failure      error
+	}{
+		{name: "interrupted-ioctl", detail: "RTC sample", failure: syscall.EINTR},
+		{name: "device-failure", detail: "RTC sample", failure: syscall.EIO},
+		{name: "RTC-expiry", detail: "RTC elapsed=6s", rtc: 6 * time.Second},
+		{name: "BOOTTIME-expiry", detail: "BOOTTIME elapsed=9s", boot: 9 * time.Second},
+		{name: "backward-RTC", detail: "RTC before anchor", rtc: -time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reads := 0
+			r := readFunc(func() (time.Time, error) {
+				reads++
+				return p.RTC.Add(tc.rtc), tc.failure
+			})
+			remaining, err := p.RemainingWithCause(p.Started.Add(tc.boot), r, time.Second)
+			if remaining != 0 || !errors.Is(err, ErrUnavailable) || !strings.Contains(err.Error(), tc.detail) {
+				t.Fatalf("denial remaining=%s cause=%v", remaining, err)
+			}
+			if tc.failure != nil && !errors.Is(err, tc.failure) {
+				t.Fatal("sample errno lost", err)
+			}
+			wantReads := 1
+			if tc.boot == 9*time.Second {
+				wantReads = 0
+			}
+			if reads != wantReads {
+				t.Fatal("diagnostic resampled the failed use", reads, wantReads)
+			}
+		})
 	}
 }
