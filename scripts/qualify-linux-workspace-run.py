@@ -46,9 +46,9 @@ def write_status(evidence, status, body):
             f"Guest system.ext4 SHA-256: {status.get('image_system_ext4_sha256','unknown')}.\n"
             f"Guest page size: {status.get('guest_page_size','preparing')} bytes.\n"
             "Authority TLS uses the verified host-local VZ virtual bridge gateway, independent of Wi-Fi addressing and DNS.\n"
-            "This run qualifies the UTC source on that image. Later directory-cache and workspace RTC-sampling "
-            "consolidation changes affect the admission path; the final candidate's admission behavior requires "
-            "the native G0 inventory. This source run does not substitute for that inventory.\n\n")
+            "This run qualifies the UTC source on that image, including its RTC-sampling consolidation and 16 KiB kernel. "
+            "The final candidate's admission behavior, including directory-cache behavior, requires the separate "
+            "native G0 inventory. This source run does not substitute for that inventory.\n\n")
     if status.get('soak'):
         notice += "Once running, this soak is exempt from the heavy token and later global HOLD windows. Unplanned disruption still invalidates it.\n\n"
     (evidence/'STATUS.md').write_text('# G3 clock run\n\n'+notice+body)
