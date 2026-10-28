@@ -53,6 +53,17 @@ import ServiceManagement
         if force && !confirm(title: "Force Remove…", detail: "Open operations will fail and unflushed changes can be lost. Remote files will be kept.", action: "Force Remove") { return }
         perform(.umount, volume: volume.volumeId, force: force)
     }
+    public func dismiss(_ outcome: PortableFSWorkspaceOutcome) {
+        guard interactive else { return }
+        perform(.dismiss, outcomeID: outcome.id)
+    }
+    public func dismissReopen(_ volume: PortableFSWorkspaceVolume) {
+        guard interactive, let id = volume.reopenId else { return }
+        perform(.dismissReopen, volume: volume.volumeId, reopenID: id)
+    }
+    public func copyDetails(outcome: PortableFSWorkspaceOutcome) {
+        copy(outcome.message + "\n" + outcome.id + "\n" + outcome.details)
+    }
     public func openDocument(authorization: Bool = false) {
         guard interactive else { return }
         let panel = NSOpenPanel()
@@ -84,11 +95,11 @@ import ServiceManagement
             try data.write(to: destination, options: .atomic)
         } catch { detail = error.localizedDescription }
     }
-    private func perform(_ operation: PortableFSWorkspaceClient.Operation, document: Data? = nil, volume: String? = nil, force: Bool = false) {
+    private func perform(_ operation: PortableFSWorkspaceClient.Operation, document: Data? = nil, volume: String? = nil, force: Bool = false, outcomeID: String? = nil, reopenID: String? = nil) {
         guard !working else { return }; working = true
         Task {
             defer { working = false }
-            do { status = try await client.perform(operation, document: document, volume: volume, force: force); detail = nil }
+            do { status = try await client.perform(operation, document: document, volume: volume, force: force, outcomeID: outcomeID, reopenID: reopenID); detail = nil }
             catch { detail = error.localizedDescription }
         }
     }
@@ -117,9 +128,17 @@ import ServiceManagement
         } catch { detail = error.localizedDescription }
     }
     public func editor(_ editor: PortableFSWorkspaceEditor, volume: PortableFSWorkspaceVolume) {
-        guard interactive, status.canConnect, volume.canOpen else { return }
+        guard interactive, status.canConnect, volume.canOpen, !working else { return }
+        working = true
         Task {
-            do { try await editor.open(volume: volume.volumeId) }
+            defer { working = false }
+            do {
+                try await editor.open(volume: volume.volumeId)
+                if let id = volume.reopenId {
+                    status = try await client.perform(.dismissReopen, volume: volume.volumeId, reopenID: id)
+                }
+                detail = nil
+            }
             catch { showError(error.localizedDescription) }
         }
     }

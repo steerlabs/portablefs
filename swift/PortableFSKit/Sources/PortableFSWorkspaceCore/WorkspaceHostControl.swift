@@ -10,6 +10,7 @@ public enum WorkspaceHostControl {
     public static let starting = "Starting Linux Workspace…"
     public static let running = "Linux Workspace: Running"
     public static let authorizationRequired = "Authorization required"
+    public static let outcomeCapacity = "Dismiss a previous write outcome before adding or replacing a volume"
     public static let busy = "Volume is in use. Close its terminals and editor windows, then try again."
     public static let macConflict = "This volume is mounted on your Mac. Unmount it there before using it in Linux."
     public static let linuxConflict = "This volume is in Linux. Remove it from Linux before mounting it on your Mac."
@@ -46,7 +47,7 @@ public enum WorkspaceHostControl {
     public static func decodeRequest(_ data: Data) throws -> WorkspaceHostRequest {
         guard data.count <= maxFrame else { throw WorkspaceControlError.grammar }
         try PortableFSDStrictJSON.validate(data)
-        let value = try object(JSONSerialization.jsonObject(with: data), keys: ["version", "operation", "document", "volumeId", "force"])
+        let value = try object(JSONSerialization.jsonObject(with: data), keys: ["version", "operation", "document", "volumeId", "force", "outcomeId", "reopenId"])
         if let document = value["document"] { try WorkspaceConnectionDocument.validateShape(document) }
         let request = try JSONDecoder().decode(WorkspaceHostRequest.self, from: data)
         try request.validate(); return request
@@ -58,10 +59,16 @@ public struct WorkspaceHostRequest: Codable, Sendable {
     public var document: WorkspaceConnectionDocument?
     public var volumeId: String?
     public var force: Bool?
+    public var outcomeId: String?
+    public var reopenId: String?
     public func validate() throws {
         guard version == 1 else { throw WorkspaceControlError.grammar }
+        guard operation == "dismiss" || outcomeId == nil else { throw WorkspaceControlError.grammar }
+        guard operation == "dismiss-reopen" || reopenId == nil else { throw WorkspaceControlError.grammar }
         switch operation {
         case "start", "status": guard document == nil, volumeId == nil, force != true else { throw WorkspaceControlError.grammar }
+        case "dismiss-reopen": guard document == nil, let volumeId, WorkspaceHostControl.validVolume(volumeId), force != true, let reopenId, PortableFSWorkspaceStatus.validIncarnation(reopenId) else { throw WorkspaceControlError.grammar }
+        case "dismiss": guard document == nil, volumeId == nil, force != true, let outcomeId, PortableFSWorkspaceOutcome.validID(outcomeId) else { throw WorkspaceControlError.grammar }
         case "stop": guard document == nil, volumeId == nil else { throw WorkspaceControlError.grammar }
         case "mount": guard let document, volumeId == nil, force != true else { throw WorkspaceControlError.grammar }; try document.validate()
         case "umount": guard document == nil, let volumeId, WorkspaceHostControl.validVolume(volumeId) else { throw WorkspaceControlError.grammar }

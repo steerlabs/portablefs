@@ -16,7 +16,7 @@ import shutil
 import signal
 from linux_workspace_native_managed import NativeAuthority
 from linux_workspace_native_lifecycle import lifecycle_checks
-from linux_workspace_native_product import product_checks
+from linux_workspace_native_product import product_checks, wait_for_hold
 from linux_workspace_native_g0 import pause_checks
 
 binary, image, evidence, inventory, *options = sys.argv[1:]
@@ -38,6 +38,7 @@ def record(name):
     assert name in required and name not in passed, name
     passed.append(name)
     print('PASS:', name, flush=True)
+    wait_for_hold()
 
 
 def defer_case(name):
@@ -48,6 +49,7 @@ def defer_case(name):
 
 class Guest:
     def __init__(self):
+        wait_for_hold()
         self.lines = queue.Queue()
         self.history = []
         self.stderr = (root / ('owner-' + str(len(measurements)) + '.stderr')).open('w')
@@ -232,7 +234,7 @@ try:
     before = json.loads(guest.ssh('cat /run/portablefs-workspace/clock.json'))
     assert before['generation'] == 0 and before['sample_age_ns'] <= 250_000_000
     record('rtc-boot-correction')
-    clock_arguments = ['--seconds', '1800', '--dry-run'] if os.environ.get('PFS_NATIVE_CLOCK_DRY_RUN') == '1' else ['--seconds', '65']
+    clock_arguments = ['--seconds', '1800', '--dry-run'] if os.environ.get('PFS_NATIVE_CLOCK_DRY_RUN') == '1' else []
     subprocess.run([sys.executable, str(pathlib.Path(__file__).with_name('qualify-linux-workspace-clock.py')), image, guest.ready['ssh_config'], str(root/'clock-qualification'), *clock_arguments], check=True)
     record('rtc-awake-measurement')
     authority = NativeAuthority(root)

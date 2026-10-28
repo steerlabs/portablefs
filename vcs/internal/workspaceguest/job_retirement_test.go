@@ -78,14 +78,19 @@ func TestCompletedUmountsReleaseAcknowledgedCapacity(t *testing.T) {
 	}
 	t.Cleanup(s.ChannelLost)
 	rid := uint64(1)
-	for i := range control.MaxMounts {
+	for i := range 1000 {
 		for _, op := range []string{"mount", "umount"} {
 			rid++
 			if err := s.AcceptJob(jobRequest(rid, retirementVolume(i, 4), op)); err != nil {
 				t.Fatal(i, op, err)
 			}
 			waitDesiredJobsJoined(t, s)
-			observed := s.Status().Retired
+			status := s.Status()
+			encodable(t, status)
+			if len(status.Mounts) != 0 || len(status.Jobs) != 0 || len(s.Retired()) > 1 {
+				t.Fatal("clean cycle retained owners", status)
+			}
+			observed := status.Retired
 			if len(observed) != 1 || observed[0].Job.Operation != op || observed[0].Job.Phase != "complete" {
 				t.Fatalf("missing exact completion: %v", observed)
 			}
@@ -99,7 +104,7 @@ func TestCompletedUmountsReleaseAcknowledgedCapacity(t *testing.T) {
 	}
 	rid++
 	if err := s.AcceptJob(jobRequest(rid, retirementVolume(99, 4), "mount")); err != nil {
-		t.Fatalf("64 completed umounts permanently exhaust desired capacity: %v", err)
+		t.Fatalf("1000 completed umounts permanently exhaust desired capacity: %v", err)
 	}
 }
 

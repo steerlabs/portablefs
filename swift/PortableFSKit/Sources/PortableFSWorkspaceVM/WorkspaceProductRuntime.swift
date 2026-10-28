@@ -47,6 +47,12 @@ public extension WorkspaceProductRuntime { var failureMessage: String { "" } }
         state = try WorkspaceState(directory: directory, ownership: executionReference)
         vm = try WorkspaceMachine(artifact: artifact, dataDisk: directory.appendingPathComponent("data.ext4"), serialLog: directory.appendingPathComponent("serial.log"), machineID: state.machineID, macAddress: state.macAddress, executionReference: executionReference.fileHandle)
         channel = WorkspaceVsockChannel(vm: vm); bridge = WorkspaceSSHBridge(vm: vm, socket: state.socket)
+        #if WORKSPACE_SERVICE_TESTING
+        if Bundle.main.bundleIdentifier?.hasPrefix("dev.portablefs.workspace-tests.") == true {
+            let hold = directory.appendingPathComponent("test-retire-ack.hold")
+            channel.testRetirementAckHeld = { FileManager.default.fileExists(atPath: hold.path) }
+        }
+        #endif
         var hello = WorkspaceHello(); hello.release = artifact.release; hello.bootID = random.next(); hello.hostServiceID = random.next(); self.hello = hello
         coordinator = try WorkspaceCoordinator(host: hello, oldInstanceAbsent: true, vm: vm, power: power, channel: channel, clock: clock, nonces: random, startBudget: 150_000_000_000)
         vm.onSeed = { [weak self] in self?.seed($0) }
@@ -57,7 +63,9 @@ public extension WorkspaceProductRuntime { var failureMessage: String { "" } }
         let consume = channel.statusObserver
         channel.statusObserver = { [weak self] status in
             guard let self, let persist = self.onStatus else { throw WorkspaceControlError.transition }
-            // Durably retain retirement/loss before coordinator acknowledgement.
+            // Validate the paired owner before durable observation can retire
+            // guest cleanup intent. ACK still follows the durable commit.
+            guard self.coordinator.ownsStatus(status) else { throw WorkspaceControlError.transition }
             try persist(status); try consume?(status)
         }
     }

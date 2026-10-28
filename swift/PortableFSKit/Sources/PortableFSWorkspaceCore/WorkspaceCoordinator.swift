@@ -464,9 +464,12 @@ public enum WorkspaceVMState { case stopped, running, paused, unknown }
     // All observers, including the dev probe, hand snapshots to this owner.
     // Retirement reconciliation precedes acknowledgement and is independent for
     // each mount/job: a missing later page cannot pin an already retired owner.
+    public func ownsStatus(_ status: WorkspaceStatusReply) -> Bool {
+        WorkspaceControl.validStatus(status) && status.bootID == host.bootID &&
+            status.hostServiceID == host.hostServiceID && status.guestServiceID == guestServiceID
+    }
     public func observeStatus(_ status: WorkspaceStatusReply) throws {
-        guard WorkspaceControl.validStatus(status), status.bootID == host.bootID,
-              status.hostServiceID == host.hostServiceID, status.guestServiceID == guestServiceID else { throw WorkspaceControlError.transition }
+        guard ownsStatus(status) else { throw WorkspaceControlError.transition }
         // The sole correlated FIFO consumes each snapshot before dispatching
         // another exchange. A pre-ack snapshot cannot arrive after its ack.
         let publishesReadiness = (phase == .running || phase == .recovering) && status.generation == generation && status.state == "running"

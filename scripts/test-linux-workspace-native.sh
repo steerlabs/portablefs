@@ -14,16 +14,23 @@ image="$1" evidence="$2"
 shift 2
 mkdir -p "$evidence"
 evidence="$(cd "$evidence" && pwd -P)"
-bash "$repo/scripts/test-linux-workspace-image.sh"
-bash "$repo/scripts/build-linux-workspace-dev.sh"
+run_phase() {
+  while [[ -n "${PFS_TEST_HOLD_FILE:-}" && -e "$PFS_TEST_HOLD_FILE" ]]; do
+    echo 'HOLD: waiting between native verification phases'
+    sleep 30
+  done
+  "$@"
+}
+run_phase bash "$repo/scripts/test-linux-workspace-image.sh"
+run_phase bash "$repo/scripts/build-linux-workspace-dev.sh"
 bin="$(swift build --package-path "$repo/swift/PortableFSKit" --show-bin-path)/portablefs-workspace-dev"
-"$bin" --check-virtualization
-bash "$repo/scripts/build-linux-workspace-image.sh" "$image" --reuse
+run_phase "$bin" --check-virtualization
+run_phase bash "$repo/scripts/build-linux-workspace-image.sh" "$image" --reuse
 comparison="$(mktemp -d "$evidence/repro.XXXXXX")"
 trap 'rm -r "$comparison"' EXIT
-bash "$repo/scripts/build-linux-workspace-image.sh" "$comparison"
+run_phase bash "$repo/scripts/build-linux-workspace-image.sh" "$comparison"
 cmp "$image/manifest.json" "$comparison/manifest.json"
 echo 'PASS: reproducible-image-build-twice'
-bash "$repo/scripts/test-linux-workspace-rtc.sh" "$image" "$evidence"
-bash "$repo/scripts/test-linux-workspace-g0.sh" "$image" "$evidence"
-python3 "$repo/scripts/test-linux-workspace-native.py" "$bin" "$image" "$evidence" "$repo/scripts/linux-workspace-required-native-tests.txt" "$@"
+run_phase bash "$repo/scripts/test-linux-workspace-rtc.sh" "$image" "$evidence"
+run_phase bash "$repo/scripts/test-linux-workspace-g0.sh" "$image" "$evidence"
+run_phase python3 "$repo/scripts/test-linux-workspace-native.py" "$bin" "$image" "$evidence" "$repo/scripts/linux-workspace-required-native-tests.txt" "$@"

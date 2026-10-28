@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import PortableFSWorkspaceCore
 @testable import PortableFSAppCore
 import PortableFSKit
 import ServiceManagement
@@ -40,8 +41,42 @@ import SwiftUI
                 _=Darwin.shutdown(fd,SHUT_RD)
                 try await Task.sleep(for:.milliseconds(200))
                 exit(0)
+            case ["--workspace-seed-main-job-overflow"]:
+                guard Bundle.main.bundleIdentifier?.hasPrefix("dev.portablefs.workspace-tests.") == true else { exit(64) }
+                let directory = try testHome().appendingPathComponent(".local/state/portablefs/workspace")
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+                guard !FileManager.default.fileExists(atPath: directory.appendingPathComponent("desired.json").path) else { exit(64) }
+                var status = WorkspaceStatusReply(); status.state = "running"
+                status.bootID = Data(repeating: 1, count: 16); status.hostServiceID = Data(repeating: 2, count: 16); status.guestServiceID = Data(repeating: 3, count: 16)
+                var pages: [String] = []
+                for index in 1...128 {
+                    var mount = WorkspaceMountID(); mount.authorityID = Data(repeating: 4, count: 32); mount.volumeID = "old-clean"
+                    mount.incarnation = Data(repeating: UInt8((index + 1) / 2), count: 16)
+                    var retired = WorkspaceRetiredOutcome(); retired.retirementSequence = UInt64(index)
+                    if index % 2 == 1 {
+                        var job = WorkspaceMountJob(); job.mount = mount; job.requestID = UInt64((index + 1) / 2)
+                        job.operation = "umount"; job.phase = "complete"; retired.job = job
+                    } else {
+                        var resolved = WorkspaceMountStatus(); resolved.mount = mount; resolved.state = "terminal"
+                        resolved.reason = "unmounted"; resolved.cleanup = "complete"; resolved.renewal.state = "not-required"
+                        resolved.outcome.durability = "durable"; resolved.outcome.observation = "observed"; resolved.outcome.release = "released"
+                        retired.mountStatus = resolved
+                    }
+                    status.retired = [retired]
+                    var frame = WorkspaceEnvelope(); frame.version = 8; frame.requestID = 1; frame.statusReply = status
+                    pages.append(try WorkspaceControl.encode(frame).base64EncodedString())
+                }
+                let raw = try JSONSerialization.data(withJSONObject: ["version": 2, "running": false, "volumes": [], "retained": pages, "current": pages[127]])
+                for (name, data) in [("resources.present", Data("8\n".utf8)), ("desired.json", raw)] {
+                    let file = directory.appendingPathComponent(name); try data.write(to: file, options: .atomic)
+                    guard chmod(file.path, 0o600) == 0 else { exit(1) }
+                }
+                print("64 ordinary jobs and 64 clean mount outcomes, plus current snapshot"); exit(0)
             case ["--unregister-workspace-test"]:
-                try await SMAppService.agent(plistName:id + ".workspace.plist").unregister(); exit(0)
+                let service = SMAppService.agent(plistName: id + ".workspace.plist")
+                if service.status != .notRegistered && service.status != .notFound { try await service.unregister() }
+                guard service.status == .notRegistered || service.status == .notFound else { exit(1) }
+                exit(0)
             case let args where args.count == 2 && args[0] == "--workspace-api":
                 let client = try client()
                 guard let action = PortableFSWorkspaceClient.Operation(rawValue: args[1]) else { exit(64) }
@@ -49,6 +84,9 @@ import SwiftUI
                 print(String(decoding: try JSONEncoder().encode(status), as: UTF8.self)); exit(0)
             case let args where args.count == 3 && args[0] == "--workspace-api" && args[1] == "mount":
                 let status = try await client().perform(.mount, document: Data(contentsOf: URL(fileURLWithPath: args[2])))
+                print(String(decoding: try JSONEncoder().encode(status), as: UTF8.self)); exit(0)
+            case let args where args.count == 3 && args[0] == "--workspace-api" && args[1] == "dismiss":
+                let status = try await client().perform(.dismiss, outcomeID: args[2])
                 print(String(decoding: try JSONEncoder().encode(status), as: UTF8.self)); exit(0)
             case let args where args.count == 3 && args[0] == "--workspace-api" && args[1] == "umount":
                 let status = try await client().perform(.umount, volume: args[2])

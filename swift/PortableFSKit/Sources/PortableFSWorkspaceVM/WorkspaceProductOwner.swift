@@ -44,9 +44,22 @@ import PortableFSAppCore
             // finish an already accepted Stop before final exclusion.
             let admission = ["start", "mount"].contains(request.operation) ? try acquireAdmission() : nil
             defer { withExtendedLifetime(admission) {} }
-            guard !quiescing || request.operation == "status" else { throw WorkspaceVMError("workspace service is quiescing") }
+            guard !quiescing || ["status", "dismiss", "dismiss-reopen"].contains(request.operation) else { throw WorkspaceVMError("workspace service is quiescing") }
             switch request.operation {
             case "status": break
+            case "dismiss":
+                guard let id = request.outcomeId else { throw WorkspaceControlError.grammar }
+                try store.dismiss(id)
+                if runtime == nil, store.value.execution == nil { try releaseAbsentReservations() }
+            case "dismiss-reopen":
+                // Editor launch can outlive recovery; only its ready incarnation owns this reminder.
+                if let index = store.value.volumes.firstIndex(where: { $0.connection.volumeId == request.volumeId }),
+                   snapshot().volumes.first(where: { $0.volumeId == request.volumeId })?.state == "ready",
+                   let mount = try store.value.volumes[index].request?.guestIdentity().mount,
+                   mount.incarnation.map({ String(format: "%02x", $0) }).joined() == request.reopenId,
+                   store.value.volumes[index].reopenRequired {
+                    try store.commit { $0.volumes[index].reopenRequired = false }
+                }
             case "start":
                 guard !stopRequested else { throw WorkspaceVMError("workspace stop is pending") }
                 try store.commit { $0.running = true }; try startIfNeeded()
@@ -89,16 +102,15 @@ import PortableFSAppCore
             } else {
                 guard document.kind == "connection" else { throw WorkspaceVMError("import an authorization response") }
                 if old.operation == "terminal" {
-                    if old.authorizationConsumed, let identity = try old.request?.guestIdentity() {
-                        let observed = (latest?.mounts ?? []) + (latest?.retired.filter(\.hasMountStatus).map(\.mountStatus) ?? []) + store.value.retained.compactMap { try? WorkspaceControl.decode($0).statusReply.retired.first?.mountStatus }
-                        guard observed.contains(where: { $0.mount == identity.mount && $0.cleanup == "complete" }) else { throw WorkspaceVMError("Cleanup required") }
-                    }
-                    try store.commit { $0.running = true; $0.volumes[index].operation = "identity"; $0.volumes[index].request = nil; $0.volumes[index].authorizationConsumed = false; $0.volumes[index].reopenRequired = true }
+                    if old.authorizationConsumed { guard old.cleanupComplete else { throw WorkspaceVMError("Cleanup required") } }
+                    try store.requireOutcomeCapacity(replacing: connection.volumeId)
+                    try store.commit { $0.running = true; $0.volumes[index].operation = "identity"; $0.volumes[index].request = nil; $0.volumes[index].authorizationConsumed = false; $0.volumes[index].reopenRequired = true; $0.volumes[index].cleanupComplete = false }
                 } else { try store.commit { $0.running = true } }
             }
             return
         }
         guard document.kind == "connection", store.value.volumes.count < 64 else { throw WorkspaceVMError("connection document required") }
+        try store.requireOutcomeCapacity()
         let intent = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
         let desired = WorkspaceDesiredVolume(connection: connection, intent: intent)
         let transition = try WorkspaceReservations(directory: reservationDirectory)
@@ -115,6 +127,7 @@ import PortableFSAppCore
         let admission = try acquireAdmission()
         let reference = try store.requirePriorExecutionAbsent(hostBoot: hostBoot)
 
+        try store.requireOutcomeCapacity(coldStart: true)
         let transition = try WorkspaceReservations(directory: reservationDirectory)
         defer { withExtendedLifetime((transition, admission, reference)) {} }
         try PortableFSProductUpdate.requireNormalAdmission(accountDirectory: reservationDirectory)
@@ -124,12 +137,11 @@ import PortableFSAppCore
         instance.onStatus = { [weak self] in guard let self else { throw WorkspaceControlError.transition }; try self.observe($0) }
         instance.onChange = { [weak self] in self?.scheduleUpdate() }
         try store.commit { state in
-            if let current = state.current, !state.retained.contains(current) { state.retained.append(current) }
-            state.current = nil
+            state.current = nil; state.retirementThrough = 0
             state.execution = WorkspaceExecution(hostBoot: hostBoot, boot: instance.bootID, reference: reference.identity)
             // Fresh boot requests fresh initial authorization for a new MountID.
             // Desired availability, key/scope (in guest) and old evidence survive.
-            for index in state.volumes.indices { state.volumes[index].lastJob = 0; state.volumes[index].request = nil; state.volumes[index].authorizationConsumed = false; state.volumes[index].operation = "identity" }
+            for index in state.volumes.indices { state.volumes[index].lastJob = 0; state.volumes[index].request = nil; state.volumes[index].authorizationConsumed = false; state.volumes[index].operation = "identity"; state.volumes[index].cleanupComplete = false }
         }
         runtimeStarted = false; cleanStopConfirmed = false
         runtime = instance
@@ -170,11 +182,14 @@ import PortableFSAppCore
                 // Termination proves resource absence, never the outcome of
                 // work whose final drain was not observed. Keep that fact
                 // across future boots, even if no status frame arrived.
-                if runtimeStarted && !cleanStopConfirmed { try store.retainUnobservedExecution() }
+                if runtimeStarted && !cleanStopConfirmed && store.value.execution != nil { try store.retainUnobservedExecution() }
                 try store.commit { state in
-                    if let raw=state.current, let frame=try? WorkspaceControl.decode(raw), !frame.statusReply.mounts.isEmpty, !state.retained.contains(raw) {
-                        guard state.retained.count < 128 else { throw WorkspaceVMError("workspace evidence capacity reached") }
-                        state.retained.append(raw)
+                    if let raw = state.current {
+                        let frame = try WorkspaceControl.decode(raw)
+                        for mount in frame.statusReply.mounts {
+                            var page = frame; page.statusReply.mounts = [mount]; page.statusReply.jobs = []; page.statusReply.retired = []
+                            try WorkspaceHostState.retain(mount, evidence: WorkspaceControl.encode(page), state: &state)
+                        }
                     }
                     state.current=nil; state.execution=nil
                     if stopRequested { state.running=false }
@@ -224,6 +239,12 @@ import PortableFSAppCore
                 switch volume.operation {
                 case "identity":
                     guard runtime.phase == .running else { continue }
+                    do { try store.requireOutcomeCapacity(replacing: name) }
+                    catch {
+                        let message = String(describing: error)
+                        if volume.message != message { try changeVolume(volume) { $0.message = message } }
+                        continue
+                    }
                     var request = WorkspaceIdentityRequest(); request.volumeID = name
                     request.authorityID = Data(stride(from: 0, to: volume.connection.authority.count, by: 2).compactMap { offset in UInt8(volume.connection.authority.dropFirst(offset).prefix(2), radix: 16) })
                     inFlight.insert(name)
@@ -265,20 +286,24 @@ import PortableFSAppCore
     private func observe(_ status: WorkspaceStatusReply) throws {
         var frame = WorkspaceEnvelope(); frame.version = 8; frame.requestID = 1; frame.statusReply = status
         let raw = try WorkspaceControl.encode(frame)
-        // Keep one current snapshot and all exact retired outcomes before ack.
-        // Each retained page is deduplicated; capacity refuses instead of
-        // silently losing an unobserved write outcome.
+        guard status.bootID == store.value.execution?.boot else { throw WorkspaceControlError.transition }
+        // Persist the observation cursor and exceptional outcomes before the
+        // coordinator acknowledges this batch. Clean evidence then needs no
+        // retained copy; repeated pre-ack snapshots cannot recreate a notice.
         try store.commit { state in
             state.current = raw
-            for retired in status.retired {
-                var page = status; page.mounts = []; page.jobs = []; page.retired = [retired]
-                var envelope = frame; envelope.statusReply = page
-                let evidence = try WorkspaceControl.encode(envelope)
-                if !state.retained.contains(evidence) {
-                    guard state.retained.count < 128 else { throw WorkspaceVMError("workspace evidence capacity reached") }
-                    state.retained.append(evidence)
+            for retired in status.retired where retired.retirementSequence > state.retirementThrough {
+                if retired.hasMountStatus {
+                    var page = status; page.mounts = []; page.jobs = []; page.retired = [retired]
+                    var envelope = frame; envelope.statusReply = page
+                    try WorkspaceHostState.retain(retired.mountStatus, evidence: WorkspaceControl.encode(envelope), state: &state)
+                    for index in state.volumes.indices where (try state.volumes[index].request?.guestIdentity().mount) == retired.mountStatus.mount {
+                        state.volumes[index].cleanupComplete = true
+                    }
                 }
+                state.retirementThrough = retired.retirementSequence
             }
+            WorkspaceHostState.confirmGuestRetirements(status, state: &state)
         }
         latest = status
         let jobs = status.jobs + status.retired.filter(\.hasJob).map(\.job)
@@ -348,7 +373,8 @@ import PortableFSAppCore
         return reply
     }
     public func snapshot() -> WorkspaceHostReply {
-        var result = WorkspaceHostReply(); result.desiredRunning = store.value.running; result.retainedEvidence=store.value.retained
+        var result = WorkspaceHostReply(); result.desiredRunning = store.value.running; result.retainedEvidence=store.retainedOutcomes.compactMap(\.evidence)
+        result.outcomes=store.retainedOutcomes.map(\.notice)
         result.previousWriteOutcomeUnknown = store.previousWriteOutcomeUnknown || runtime == nil && store.value.execution != nil
         if !failure.isEmpty { result.state = "cleanup-required"; result.message = failure }
         else if runtime == nil, store.value.execution != nil { result.state="cleanup-required";result.message="Cleanup required" }
@@ -359,15 +385,12 @@ import PortableFSAppCore
             else if [.draining, .pausing, .pausedCold, .resuming, .recovering].contains(runtime.phase) { result.state = "reconnecting"; result.message = "Reconnecting…" }
             else { result.state = "starting"; result.message = WorkspaceHostControl.starting }
         }
-        for evidence in store.value.retained {
-            guard let frame = try? WorkspaceControl.decode(evidence) else { continue }
-            let statuses = frame.statusReply.mounts + frame.statusReply.retired.filter(\.hasMountStatus).map(\.mountStatus)
-            result.someChangesWereNotSaved = result.someChangesWereNotSaved || statuses.contains { !$0.loss.isEmpty || $0.outcome.durability == "lost" }
-            result.previousWriteOutcomeUnknown = result.previousWriteOutcomeUnknown || statuses.contains { $0.outcome.observation == "unobserved" || $0.outcome.durability == "unresolved" }
-        }
+        result.someChangesWereNotSaved = result.outcomes.contains { $0.someChangesWereNotSaved }
+        result.previousWriteOutcomeUnknown = result.previousWriteOutcomeUnknown || result.outcomes.contains { $0.previousWriteOutcomeUnknown }
         for desired in store.value.volumes {
             let state: String
-            if desired.message == WorkspaceHostControl.busy { state = "busy" }
+            if desired.message == WorkspaceHostControl.outcomeCapacity { state = "pending" }
+            else if desired.message == WorkspaceHostControl.busy { state = "busy" }
             else if desired.operation == "authorization-required" || desired.operation == "identity" { state = "authorization-required" }
             else if desired.operation == "ready" { state = "ready" }
             else if desired.operation == "terminal" { state = "terminal" }
@@ -380,7 +403,10 @@ import PortableFSAppCore
                 if current.state == "authorization-required" { volume.state = "authorization-required"; volume.message = WorkspaceHostControl.authorizationRequired }
             }
             if volume.state == "ready", desired.reopenRequired { volume.message = "Reconnect your editor and reopen this folder." }
-            if runtime == nil, store.value.execution == nil { volume.state="stopped";volume.message="Linux Workspace: Stopped" }
+            if volume.state == "ready", volume.requiresReopen, let mount = try? desired.request?.guestIdentity().mount {
+                volume.reopenId = mount.incarnation.map { String(format: "%02x", $0) }.joined()
+            }
+            if runtime == nil, store.value.execution == nil { volume.state="stopped";volume.message="Linux Workspace: Stopped";volume.reopenId=nil }
             if desired.request != nil { volume.authorizationRequest = store.directory.url.appendingPathComponent("authorization-" + desired.connection.volumeId + ".pfsworkspace").path }
             if let latest {
                 var page = latest; page.mounts = page.mounts.filter { $0.mount.volumeID == volume.volumeId }; page.jobs = page.jobs.filter { $0.mount.volumeID == volume.volumeId }

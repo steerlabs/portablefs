@@ -9,11 +9,14 @@ control or SSH endpoints still prove no VM absence.
 The owner acquires `flock(LOCK_EX | LOCK_NB)` on a fresh open description of
 the existing `owner.lock` in the validated workspace state directory before
 constructing the VM. WorkspaceState validates and adopts that same reference;
-it does not take a second lock. Private desired-state format 2 records its
+it does not take a second lock. Private desired-state format 3 records its
 device/inode with the execution
 identity before VZ Start. A successor never substitutes a recreated inode for a
-same-boot execution. Unequal desired-state formats refuse; no historical decoder
-or conversion exists. Authority and paired workspace control remain protocol 8.
+same-boot execution. Main's unreleased protocol-8 desired state 2 has one explicit
+repair to format 3 for the full ordinary-job history defect. It validates every
+frame, keeps exceptional outcomes and the execution reference, and publishes the
+sticky unknown notice before retiring the old witness. Other formats or malformed
+evidence refuse unchanged. Authority and paired workspace control remain protocol 8.
 
 The same file handle becomes the writing handle of a dedicated, output-only
 `VZFileHandleSerialPortAttachment`. The immutable VM configuration retains this
@@ -67,10 +70,12 @@ in flight through XPC also retain the lock; loss of the client alone cannot rele
 them. State and reservation locks continue to serialize all user transitions.
 
 Acquisition proves old execution absence, not prior write durability. The host
-retains the prior status before installing the new boot identity. The fresh Linux
+atomically retains the prior execution's unknown outcome before clearing its
+execution identity and installing a new boot identity. The fresh Linux
 kernel then uses the existing cold reconciliation and loss-retention rules; no old
 RAM, child process, descriptor or session is adopted. Removal and unattended update
-still refuse unresolved or lost work. A different host kernel boot proves the old
+still refuse unacknowledged unknown or lost outcomes. Only exact Dismiss
+acknowledges a retained notice; it never proves write durability. A different host kernel boot proves the old
 execution absent independently, without upgrading its write outcome.
 
 ## Why process and disk scans remain insufficient

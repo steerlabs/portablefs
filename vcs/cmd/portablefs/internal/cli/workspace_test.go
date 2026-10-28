@@ -9,7 +9,7 @@ import (
 )
 
 func TestWorkspaceExactlyFiveVerbsAndFlags(t *testing.T) {
-	for _, args := range [][]string{{"start"}, {"status", "--json"}, {"umount", "vol-1", "--force", "--json"}, {"stop", "--json"}, {"stop", "--force"}} {
+	for _, args := range [][]string{{"start"}, {"status", "--json"}, {"status", "--dismiss", "1/01010101010101010101010101010101/vol-1", "--json"}, {"umount", "vol-1", "--force", "--json"}, {"stop", "--json"}, {"stop", "--force"}} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			e, out, errs := testEnv(t)
 			called := false
@@ -25,7 +25,7 @@ func TestWorkspaceExactlyFiveVerbsAndFlags(t *testing.T) {
 			}
 		})
 	}
-	for _, args := range [][]string{{}, {"shell"}, {"pause"}, {"identity"}, {"exec", "true"}, {"vm-list"}, {"ssh-config"}, {"start", "--json"}, {"start", "--force"}, {"status", "--force"}, {"umount", "../bad"}, {"umount"}, {"stop", "extra"}, {"mount"}, {"mount", "key.pem"}} {
+	for _, args := range [][]string{{}, {"shell"}, {"pause"}, {"identity"}, {"exec", "true"}, {"vm-list"}, {"ssh-config"}, {"start", "--json"}, {"start", "--force"}, {"status", "--force"}, {"status", "--dismiss", ""}, {"status", "--dismiss", "all"}, {"dismiss", "1/01010101010101010101010101010101/vol-1"}, {"stop", "--dismiss", "1/01010101010101010101010101010101/vol-1"}, {"umount", "../bad"}, {"umount"}, {"stop", "extra"}, {"mount"}, {"mount", "key.pem"}} {
 		t.Run("refuse "+strings.Join(args, " "), func(t *testing.T) {
 			e, _, _ := testEnv(t)
 			e.workspaceRequestFn = func(context.Context, workspacehost.Request) (workspacehost.Reply, error) {
@@ -68,5 +68,24 @@ func TestWorkspaceCleanupRequiredStatusKeepsMachineReadableEvidence(t *testing.T
 	}
 	if reply.State != "cleanup-required" || !reply.PreviousWriteOutcomeUnknown || !reply.DesiredRunning || errs.Len() != 0 {
 		t.Fatalf("cleanup status changed: %+v, stderr=%s", reply, errs)
+	}
+}
+
+func TestWorkspaceStatusNamesExactOutcomeAndDismissUsesOnlyStatusVerb(t *testing.T) {
+	const id = "8/08080808080808080808080808080808/vol-1"
+	e, out, errs := testEnv(t)
+	var requests []workspacehost.Request
+	e.workspaceRequestFn = func(_ context.Context, request workspacehost.Request) (workspacehost.Reply, error) {
+		requests = append(requests, request)
+		return workspacehost.Reply{Version: 1, State: "stopped", Message: "Linux Workspace: Stopped", Volumes: []workspacehost.Volume{}, Outcomes: []workspacehost.Outcome{{ID: id, SomeChangesWereNotSaved: true}}}, nil
+	}
+	if cmdWorkspace(e, []string{"status"}) != 0 || !strings.Contains(out.String(), "Some changes were not saved") || !strings.Contains(out.String(), "portablefs workspace status --dismiss "+id) {
+		t.Fatal(out, errs)
+	}
+	if cmdWorkspace(e, []string{"status", "--dismiss", id}) != 0 {
+		t.Fatal(errs)
+	}
+	if len(requests) != 2 || requests[0].Operation != "status" || requests[0].OutcomeID != "" || requests[1].Operation != "dismiss" || requests[1].OutcomeID != id {
+		t.Fatal(requests)
 	}
 }

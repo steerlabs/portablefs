@@ -10,8 +10,8 @@ Until then a gate failure can still change a detail here; such a change is
 made to this document and the code together, never silently.
 
 Protocol 8 replaces every earlier protocol. Nothing earlier shipped, so there
-is no older client, authority, Mac artifact, on-disk state, or release line to
-serve, convert, or refuse by name. An unequal version is refused because it is
+is no earlier-protocol client, authority, Mac artifact, on-disk state, or release
+line to serve, convert, or refuse by name. An unequal version is refused because it is
 unequal.
 
 If a surface is not listed here, treat it as internal and unstable.
@@ -107,9 +107,9 @@ another, and none is bumped to match another.
 | Authority host kernel | Linux 5.17 final or newer | Refused at storage startup below 5.17 and for 5.17 release candidates; later release candidates are accepted. |
 | `pfslocal` (daemon to FSKit extension) | 2.0 | Exact major and minor; paired within one signed release. |
 | Linux workspace control | `8` | Exact paired, unreleased host/guest and local mount controls; typed renewal/outcome evidence, bounded desired-job progress, one shared acknowledged mount/job retirement stream with reserved per-key capacity and exact terminal-result observation before successor admission (MountJob field 8 and StatusReply field 9 reserved), admission-only predecessor-unobserved refusals, a paired 1 MiB frame bound, and one remaining Suspend drain allowance outside token identity; paired AwakeRecover tag 25 with explicit Suspension.awake_recovery field 7 and asynchronous fixed-roster admission, guest IdentityRequest/IdentityReply tags 23/24, Provision server_name 8 and hosted_enrollment 9. Finite job/action ownership reconciles through observation; no response receipts or older decoder. |
-| Workspace host operational API | `1` | Exact paired signed-release Unix-socket API; one bounded JSON request/reply, separate from guest control 8. |
+| Workspace host operational API | `1` | Exact paired signed-release Unix-socket API; one bounded JSON request/reply, separate from guest control 8; exact retained-outcome Dismiss and ready-incarnation editor-reminder Dismiss remain separate actions. |
 | Workspace connection document | `1` | Exact public `.pfsworkspace` connection/request/authorization variants; guest keys never cross this boundary. |
-| Workspace desired state and volume reservations | `2`, `1` | Exact private formats; one per-user transition lock and retained execution/cleanup intent. Execution pins the VM-held lock inode. |
+| Workspace desired state and volume reservations | `3`, `1` | Exact private formats; one per-user transition lock, retained execution/cleanup intent and exact outcome acknowledgement. Execution pins the VM-held lock inode. |
 | Daemon operational control | `2` | Exact; `X-PortableFS-Control-Protocol` header and `/v2/` paths; paired within one signed release. |
 | Daemon lifecycle API | `1` | `/lifecycle/v1/...`; independent of the operational version and stable across releases. |
 | Daemon identity record | schema `1` | Reports the serving release's actual control and `pfslocal` versions. |
@@ -591,9 +591,13 @@ an empty registry is never written as a file.
 ## Private state
 
 Repository-owned persistent state carries one exact format marker per owner
-and fails closed on a malformed or unequal marker. No historical decoder or
-migration exists; protocol-8 deployments are provisioned fresh. The markers
-are in the version table above. These formats are internal: a later change
+and fails closed on a malformed or unequal marker. The one prelaunch repair is
+workspace desired state 2 to 3, within protocol 8: validate main's exact publication,
+discard durably observed clean jobs, retain every exceptional mount outcome and
+carry its sticky unknown witness into an explicit notice before retiring that
+witness. Execution references and reservations survive. Only format 3 is emitted;
+malformed evidence and all other formats refuse unchanged. No earlier-protocol
+state is decoded. The markers are in the version table above. These formats are internal: a later change
 may introduce a new marker, and must then specify its own upgrade path.
 
 ## Changing a contract surface

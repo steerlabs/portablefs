@@ -108,6 +108,62 @@ Pending Mount remains owned by the existing coordinator across power transitions
 A guest restart requests fresh initial authorization; persistent key/scope/epoch
 remain owned by the guest data disk.
 
+The host discards clean retirement evidence after durably recording its exact
+guest observation cursor, then acknowledges the guest's retirement stream.
+Main's full format-2 ordinary-job store is repaired once to format 3. Every
+protocol-8 frame is validated; clean observed jobs are dropped, and exceptional
+mount outcomes, active intents, execution references and the sticky unknown
+witness survive. The unknown notice is durable before the old witness is retired,
+so a crash cannot clear or duplicate it. Malformed evidence refuses unchanged.
+Only exceptional write outcomes remain in desired state format 3. The menu
+shows each notice with **Copy Details** and **Dismiss**. Merely reading status,
+starting, stopping, recovering or replacing a mount never acknowledges a notice.
+The CLI keeps five verbs:
+
+```sh
+portablefs workspace status
+portablefs workspace status --dismiss <outcome-id> [--json]
+```
+
+Status prints each retained notice's ID and this command. The ID is
+`<sequence>/<guest-incarnation>/<volume>`: a positive host outcome sequence,
+32 lowercase hex digits naming the mount incarnation, and the exact canonical
+volume. A workspace execution whose guest status was never observed uses its
+boot incarnation and `-` for workspace scope. The paired host API operation is
+`dismiss` with one `outcomeId`. There is no bulk or implicit acknowledgement.
+An absent valid ID is an idempotent no-op, including a retry after a lost reply;
+a malformed ID refuses. An ID never selects another sequence, incarnation or
+volume. No acknowledgement history grows with use. If the guest has not yet confirmed
+its retirement ACK, a dismissed record remains as bounded cleanup intent. It is
+hidden from notices and does not block removal/update after execution absence.
+Cold replay of that exact mount incarnation preserves its notice ID and Dismiss
+decision. A complete empty guest retirement stream with no matching active key
+confirms cleanup and removes this intent, including after a lost ACK reply.
+Unacknowledged notices remain visible regardless of guest ACK.
+
+The separate reconnect-editor reminder clears after a successful menu editor-open
+action or its Dismiss button, once the volume is ready. The paired host operation
+`dismiss-reopen` carries `volumeId` and the ready row's `reopenId` mount incarnation;
+a stale or pending-volume action cannot clear a later reminder. This commits only
+`reopenRequired`, never a retained loss/unknown notice, and adds no CLI verb.
+
+Dismiss atomically commits removal of that exact retained notice through file
+sync, rename and directory sync. Only afterward may confirmed VM absence and
+reservation release remove the resource witness. A crash before the commit
+retains the notice; a crash after it may leave a conservative witness, but cannot
+recreate the notice. Dismiss acknowledges the displayed outcome; it does not
+assert that lost writes became durable or release live resources.
+
+The host reserves the same 128 slots across retained notices, admitted volume
+keys and one execution slot for a crash without guest status. Each active key
+can transfer its reserved slot into a final notice without observer overflow.
+Full capacity refuses new volume/replacement admission with a Dismiss hint.
+A cold boot reserves only its execution slot, then reconciles pending guest ACKs
+before admitting fresh desired volume identities; pending cleanup cannot deadlock
+that reconciliation. Cleanup, status and exact Dismiss remain available. Guest retirement
+ACK releases guest evidence independently of the user's later Dismiss; loss or
+unknown evidence is already durable at the host before that ACK.
+
 A durable execution witness is cleared only after confirmed VZ termination or
 exact absence proof. Neither process exit nor a released service singleton proves
 VM absence. The service gives its locked `owner.lock` description to an immutable
@@ -161,11 +217,11 @@ execution publication. The VM's durable presence marker remains through confirme
 termination. The installer acquires the exclusive guard, proves exact FSKit absence and requires the workspace's
 `resources.present` name absent. It never decodes an outgoing desired-state
 registry. The service publishes this marker durably before VM execution and
-retires it only after confirmed termination, reservation release and loss-free,
-observed outcome evidence. Unexpected termination or explicit Force Stop keeps
-an unobserved-execution fact in that witness, even if no guest status arrived.
-A subsequent clean boot does not erase that earlier uncertainty. Busy, unknown
-and lost work defer unattended update.
+retires it only after confirmed termination, reservation release and clean or
+explicitly acknowledged outcomes. Unexpected termination or explicit Force Stop
+commits an unknown outcome in desired state, even if no guest status arrived.
+A subsequent clean boot does not erase that earlier uncertainty. Busy work and
+unacknowledged unknown or lost outcomes defer unattended update.
 
 The existing token-bound activation lease also closes workspace admission in
 every nonterminal phase, including an expired interrupted transaction. It closes
@@ -196,7 +252,7 @@ A reusable numeric fusectl connection ID is not an exact retained witness.
 Process exit and terminal authorization do not establish kernel absence.
 The supervisor binds these identities progressively and persists desired ownership
 under `/data/workspace`; existing CLI records own session/mount inventory. Active slots and
-unacknowledged retired outcomes share a bound of 64. Retirements have monotonic,
+unacknowledged retired outcomes share a bound of 128 (at most 64 active keys). Retirements have monotonic,
 guest-incarnation-scoped sequence numbers.
 The observer retains exact outcomes, then acknowledges through a sequence;
 duplicate or older acknowledgements succeed without erasing newer outcomes. Full
@@ -805,7 +861,7 @@ test agent writes `product/consent-denied` and `product/consent-restored` after
 the corresponding observations. A password or Touch ID request stops the case;
 an absent UI observation fails rather than skipping it.
 When the desktop is locked, `--defer-ui` runs the complete non-UI inventory,
-including real missing-extension checks, and records the exact unrun consent and
+including recovery from main's 128-record job store and real missing-extension checks, and records the exact unrun consent and
 editor-save names. It exits 3 with an INCOMPLETE verdict, never an all-passing
 native qualification. Rerun without that flag after an authorized operator
 unlocks the session.

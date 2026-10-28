@@ -304,12 +304,10 @@ print(pids[0])
                 yield process
             finally:
                 if process.poll() is None:
-                    process.terminate()
-                    try:
-                        process.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        process.kill()
-                        process.wait(timeout=5)
+                    with contextlib.suppress(Exception): guest.ssh('touch ~/pfs-native-held.stop')
+                    # The guest owner closes its SSH sessions on teardown.
+                    # Never signal a host SSH transport, including on failure.
+                    with contextlib.suppress(subprocess.TimeoutExpired): process.wait(timeout=10)
                 process.stdout.close()
 
     def terminal_replacement(self, guest):

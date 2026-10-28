@@ -155,3 +155,11 @@ service-crash-same-boot-recovery
 service-crash-reconcile-unknown-retained
 service-loss-accepted-tail-peer
 service-loss-retained-after-clean-stop
+service-outcome-clean-1000-cycles
+service-loss-capacity-backpressure
+service-loss-double-and-unknown-dismiss
+service-loss-force-umount-dismiss-removal
+service-loss-dismiss-update
+service-crash-dismiss-update
+service-outcome-dismiss-durable
+service-loss-dismiss-before-guest-ack-crash

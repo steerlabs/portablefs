@@ -39,6 +39,8 @@ type Request struct {
 	Document  *Document `json:"document,omitempty"`
 	VolumeID  string    `json:"volumeId,omitempty"`
 	Force     bool      `json:"force,omitempty"`
+	OutcomeID string    `json:"outcomeId,omitempty"`
+	ReopenID  string    `json:"reopenId,omitempty"`
 }
 type Volume struct {
 	VolumeID string `json:"volumeId"`
@@ -48,16 +50,43 @@ type Volume struct {
 	// Typed protocol-8 evidence; retained outcomes survive replacement and Stop.
 	Evidence             []byte `json:"evidence,omitempty"`
 	AuthorizationRequest string `json:"authorizationRequest,omitempty"`
+	ReopenID             string `json:"reopenId,omitempty"`
 }
+type Outcome struct {
+	ID                          string `json:"id"`
+	SomeChangesWereNotSaved     bool   `json:"someChangesWereNotSaved"`
+	PreviousWriteOutcomeUnknown bool   `json:"previousWriteOutcomeUnknown"`
+	Details                     string `json:"details"`
+}
+
+func validIncarnation(id string) bool {
+	raw, err := hex.DecodeString(id)
+	return err == nil && workspacecontrol.ID(raw) && hex.EncodeToString(raw) == id
+}
+
+func ValidOutcomeID(id string) bool {
+	parts := strings.Split(id, "/")
+	if len(parts) != 3 {
+		return false
+	}
+	sequence, err := strconv.ParseUint(parts[0], 10, 64)
+	if err != nil || sequence == 0 || strconv.FormatUint(sequence, 10) != parts[0] {
+		return false
+	}
+	incarnation, err := hex.DecodeString(parts[1])
+	return err == nil && workspacecontrol.ID(incarnation) && hex.EncodeToString(incarnation) == parts[1] && (parts[2] == "-" || mountlifecycle.ValidVolume(parts[2]))
+}
+
 type Reply struct {
-	RetainedEvidence            [][]byte `json:"retainedEvidence"`
-	SomeChangesWereNotSaved     bool     `json:"someChangesWereNotSaved"`
-	PreviousWriteOutcomeUnknown bool     `json:"previousWriteOutcomeUnknown"`
-	Version                     int      `json:"version"`
-	State                       string   `json:"state"`
-	Message                     string   `json:"message"`
-	DesiredRunning              bool     `json:"desiredRunning"`
-	Volumes                     []Volume `json:"volumes"`
+	Outcomes                    []Outcome `json:"outcomes"`
+	RetainedEvidence            [][]byte  `json:"retainedEvidence"`
+	SomeChangesWereNotSaved     bool      `json:"someChangesWereNotSaved"`
+	PreviousWriteOutcomeUnknown bool      `json:"previousWriteOutcomeUnknown"`
+	Version                     int       `json:"version"`
+	State                       string    `json:"state"`
+	Message                     string    `json:"message"`
+	DesiredRunning              bool      `json:"desiredRunning"`
+	Volumes                     []Volume  `json:"volumes"`
 }
 
 func DecodeRequest(raw []byte) (Request, error) {
@@ -71,10 +100,24 @@ func (r Request) Validate() error {
 	if r.Version != Version {
 		return errors.New("workspace host operational version mismatch")
 	}
+	if r.Operation != "dismiss" && r.OutcomeID != "" {
+		return errors.New("unexpected workspace outcome ID")
+	}
+	if r.Operation != "dismiss-reopen" && r.ReopenID != "" {
+		return errors.New("unexpected workspace reopen ID")
+	}
 	switch r.Operation {
 	case "start", "status":
 		if r.Document != nil || r.VolumeID != "" || r.Force {
 			return errors.New("unexpected workspace request field")
+		}
+	case "dismiss-reopen":
+		if r.Document != nil || !mountlifecycle.ValidVolume(r.VolumeID) || r.Force || !validIncarnation(r.ReopenID) {
+			return errors.New("dismiss-reopen requires one exact ready mount incarnation")
+		}
+	case "dismiss":
+		if r.Document != nil || r.VolumeID != "" || r.Force || !ValidOutcomeID(r.OutcomeID) {
+			return errors.New("dismiss requires one exact outcome ID")
 		}
 	case "stop":
 		if r.Document != nil || r.VolumeID != "" {
@@ -107,6 +150,16 @@ func DecodeReply(raw []byte) (Reply, error) {
 	default:
 		return r, errors.New("invalid workspace state")
 	}
+	if len(r.Outcomes) > 128 {
+		return r, errors.New("invalid workspace outcomes")
+	}
+	seen := make(map[string]bool)
+	for _, outcome := range r.Outcomes {
+		if !ValidOutcomeID(outcome.ID) || seen[outcome.ID] || !outcome.SomeChangesWereNotSaved && !outcome.PreviousWriteOutcomeUnknown || len(outcome.Details) > 32768 {
+			return r, errors.New("invalid workspace outcome")
+		}
+		seen[outcome.ID] = true
+	}
 	if len(r.RetainedEvidence) > 128 {
 		return r, errors.New("invalid retained workspace inventory")
 	}
@@ -117,7 +170,7 @@ func DecodeReply(raw []byte) (Reply, error) {
 		}
 	}
 	for _, v := range r.Volumes {
-		if !mountlifecycle.ValidVolume(v.VolumeID) || v.Path != "/workspaces/"+v.VolumeID || len(v.Evidence) > workspacecontrol.MaxFrame {
+		if !mountlifecycle.ValidVolume(v.VolumeID) || v.Path != "/workspaces/"+v.VolumeID || len(v.Evidence) > workspacecontrol.MaxFrame || v.ReopenID != "" && (!validIncarnation(v.ReopenID) || v.State != "ready" || v.Message != "Reconnect your editor and reopen this folder.") {
 			return r, errors.New("invalid workspace volume")
 		}
 	}
