@@ -30,7 +30,7 @@ let package = Package(
         .target(name: "PortableFSWorkspaceVM", dependencies: ["PortableFSWorkspaceCore", "CWorkspacePower"]),
         .executableTarget(name: "PortableFSWorkspaceDev", dependencies: ["PortableFSWorkspaceVM"]),
         .executableTarget(name: "PortableFSWorkspaceService", dependencies: ["PortableFSWorkspaceVM", "PortableFSAppCore"]),
-        .executableTarget(name: "WorkspaceServiceTestHost", dependencies: ["PortableFSAppCore"], path: "Fixtures/WorkspaceServiceTestHost"),
+        .executableTarget(name: "WorkspaceServiceTestHost", dependencies: ["PortableFSAppCore", "PortableFSWorkspaceCore"], path: "Fixtures/WorkspaceServiceTestHost"),
         .target(
             name: "PortableFSWorkspaceCore",
             dependencies: [

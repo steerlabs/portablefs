@@ -110,6 +110,11 @@ remain owned by the guest data disk.
 
 The host discards clean retirement evidence after durably recording its exact
 guest observation cursor, then acknowledges the guest's retirement stream.
+Main's full format-2 ordinary-job store is repaired once to format 3. Every
+protocol-8 frame is validated; clean observed jobs are dropped, and exceptional
+mount outcomes, active intents, execution references and the sticky unknown
+witness survive. The unknown notice is durable before the old witness is retired,
+so a crash cannot clear or duplicate it. Malformed evidence refuses unchanged.
 Only exceptional write outcomes remain in desired state format 3. The menu
 shows each notice with **Copy Details** and **Dismiss**. Merely reading status,
 starting, stopping, recovering or replacing a mount never acknowledges a notice.
@@ -856,7 +861,7 @@ test agent writes `product/consent-denied` and `product/consent-restored` after
 the corresponding observations. A password or Touch ID request stops the case;
 an absent UI observation fails rather than skipping it.
 When the desktop is locked, `--defer-ui` runs the complete non-UI inventory,
-including real missing-extension checks, and records the exact unrun consent and
+including recovery from main's 128-record job store and real missing-extension checks, and records the exact unrun consent and
 editor-save names. It exits 3 with an INCOMPLETE verdict, never an all-passing
 native qualification. Rerun without that flag after an authorized operator
 unlocks the session.

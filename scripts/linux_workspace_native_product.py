@@ -153,6 +153,9 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         pristine.mkdir(mode=0o700)
         (pristine/'owner.lock').touch(mode=0o600)
         prepare_update()
+    if outcome_case=='removal':
+        seed=subprocess.run([str(host),'--workspace-seed-main-job-overflow'],env=env,capture_output=True,text=True,check=True)
+        (evidence/'main-overfull-seed.txt').write_text(seed.stdout)
     registered = subprocess.run([str(host),'--workspace-service-register'],env=env,capture_output=True,text=True)
     if registered.returncode:
         (evidence/'product-registration.txt').write_text(registered.stdout+registered.stderr)
@@ -201,6 +204,11 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
             time.sleep(.1)
         until(lambda s:s['state']=='stopped',30)
         snapshot('stopped')
+        if outcome_case=='removal':
+            recovered=json.loads((home/'.local/state/portablefs/workspace/desired.json').read_text())
+            assert recovered['version']==3 and not recovered['retained'],recovered
+            assert not status()['retainedEvidence'] and not status()['outcomes']
+            (evidence/'main-overfull-recovery.json').write_text(json.dumps({'legacy_job_pages':128,'legacy_mount_incarnations':64,'retained_after_recovery':len(recovered['retained']),'published_version':recovered['version']},indent=2))
         assert json.loads(app_command('--workspace-api','status').stdout)['state']=='stopped'
         record('service-app-api-client')
         subprocess.run([str(host),'--abandon-workspace-test-request'],env=env,check=True)

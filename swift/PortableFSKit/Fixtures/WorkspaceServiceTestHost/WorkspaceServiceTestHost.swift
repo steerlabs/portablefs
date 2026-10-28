@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import PortableFSWorkspaceCore
 @testable import PortableFSAppCore
 import PortableFSKit
 import ServiceManagement
@@ -40,6 +41,30 @@ import SwiftUI
                 _=Darwin.shutdown(fd,SHUT_RD)
                 try await Task.sleep(for:.milliseconds(200))
                 exit(0)
+            case ["--workspace-seed-main-job-overflow"]:
+                guard Bundle.main.bundleIdentifier?.hasPrefix("dev.portablefs.workspace-tests.") == true else { exit(64) }
+                let directory = try testHome().appendingPathComponent(".local/state/portablefs/workspace")
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+                guard !FileManager.default.fileExists(atPath: directory.appendingPathComponent("desired.json").path) else { exit(64) }
+                var status = WorkspaceStatusReply(); status.state = "running"
+                status.bootID = Data(repeating: 1, count: 16); status.hostServiceID = Data(repeating: 2, count: 16); status.guestServiceID = Data(repeating: 3, count: 16)
+                var pages: [String] = []
+                for index in 1...128 {
+                    var mount = WorkspaceMountID(); mount.authorityID = Data(repeating: 4, count: 32); mount.volumeID = "old-clean"
+                    mount.incarnation = Data(repeating: UInt8((index + 1) / 2), count: 16)
+                    var job = WorkspaceMountJob(); job.mount = mount; job.requestID = UInt64(index)
+                    job.operation = index % 2 == 0 ? "mount" : "provision"; job.phase = "complete"
+                    var retired = WorkspaceRetiredOutcome(); retired.retirementSequence = UInt64(index); retired.job = job
+                    status.retired = [retired]
+                    var frame = WorkspaceEnvelope(); frame.version = 8; frame.requestID = 1; frame.statusReply = status
+                    pages.append(try WorkspaceControl.encode(frame).base64EncodedString())
+                }
+                let raw = try JSONSerialization.data(withJSONObject: ["version": 2, "running": false, "volumes": [], "retained": pages, "current": pages[127]])
+                for (name, data) in [("resources.present", Data("8\n".utf8)), ("desired.json", raw)] {
+                    let file = directory.appendingPathComponent(name); try data.write(to: file, options: .atomic)
+                    guard chmod(file.path, 0o600) == 0 else { exit(1) }
+                }
+                print("128 retired job pages across 64 mount incarnations, plus current snapshot"); exit(0)
             case ["--unregister-workspace-test"]:
                 let service = SMAppService.agent(plistName: id + ".workspace.plist")
                 if service.status != .notRegistered && service.status != .notFound { try await service.unregister() }

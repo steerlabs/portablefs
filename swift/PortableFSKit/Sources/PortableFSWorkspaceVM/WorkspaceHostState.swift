@@ -1,3 +1,4 @@
+import CryptoKit
 import Darwin
 import Foundation
 import PortableFSAppCore
@@ -55,13 +56,20 @@ public final class WorkspaceHostState {
     // witness removal. A crash here must never resurrect a dismissed outcome.
     var afterDismissCommit: (() throws -> Void)?
     public private(set) var value: WorkspaceDesiredState
-    public init(directory: URL) throws {
+    public convenience init(directory: URL) throws {
+        try self.init(directory: directory, afterRecoveryCommit: nil)
+    }
+    init(directory: URL, afterRecoveryCommit: (() throws -> Void)?) throws {
         self.directory = try WorkspacePrivateDirectory(directory)
         singleton = try self.directory.lock("service.lock")
+        let witness = try self.directory.read("resources.present", limit: 64)
+        var recovered = false
         if let raw = try self.directory.read("desired.json", limit: 4 << 20) {
             try PortableFSDStrictJSON.validate(raw)
-            _ = try WorkspaceHostControl.object(JSONSerialization.jsonObject(with: raw), keys: ["version", "running", "execution", "volumes", "retained", "current", "outcomeSequence", "retirementThrough"])
-            value = try JSONDecoder().decode(WorkspaceDesiredState.self, from: raw)
+            let object = try WorkspaceHostControl.object(JSONSerialization.jsonObject(with: raw), keys: ["version", "running", "execution", "volumes", "retained", "current", "outcomeSequence", "retirementThrough"])
+            if object["version"] as? Int == 2 {
+                value = try Self.recoverMainStore(raw, witness: witness); recovered = true
+            } else { value = try JSONDecoder().decode(WorkspaceDesiredState.self, from: raw) }
         } else { value = WorkspaceDesiredState() }
         guard value.version == 3, value.volumes.count <= 64, value.retained.count <= 128,
               Set(value.volumes.map { $0.connection.volumeId }).count == value.volumes.count else { throw WorkspaceVMError("invalid workspace desired state") }
@@ -92,10 +100,55 @@ public final class WorkspaceHostState {
         let keys = value.retained.compactMap(\.guestMountKey)
         guard Set(keys).count == keys.count else { throw WorkspaceControlError.grammar }
         if let raw = value.current { _ = try WorkspaceControl.decode(raw) }
-        switch try self.directory.read("resources.present", limit: 64) {
-        case nil, Data("8\n".utf8): break
-        default: throw WorkspaceVMError("invalid workspace resource witness")
+        let sticky = witness == Data("8\nunobserved\n".utf8)
+        guard witness == nil || witness == Data("8\n".utf8) || sticky && previousWriteOutcomeUnknown else { throw WorkspaceVMError("invalid workspace resource witness") }
+        if recovered {
+            // Preserve the old sticky witness until its unknown notice is durable.
+            // A crash between these publications reopens the same notice ID.
+            if !sticky, value.execution != nil || Self.hasUnresolvedOutcome(value) {
+                try self.directory.write("resources.present", data: Data("8\n".utf8))
+            }
+            try self.directory.write("desired.json", data: WorkspaceHostControl.encode(value))
+            try afterRecoveryCommit?()
         }
+        if sticky { try self.directory.write("resources.present", data: Data("8\n".utf8)) }
+    }
+    /// Main's unreleased protocol-8 store persisted every retired job. Normalize
+    /// that exact publication once; malformed evidence and other formats refuse.
+    private static func recoverMainStore(_ raw: Data, witness: Data?) throws -> WorkspaceDesiredState {
+        var object = try WorkspaceHostControl.object(JSONSerialization.jsonObject(with: raw), keys: ["version", "running", "execution", "volumes", "retained", "current"])
+        guard object["version"] as? Int == 2, let pages = object["retained"] as? [String], pages.count <= 128,
+              let volumes = object["volumes"] as? [[String: Any]], volumes.count <= 64 else { throw WorkspaceControlError.grammar }
+        object["version"] = 3; object["retained"] = []; object["outcomeSequence"] = 0; object["retirementThrough"] = 0
+        object["volumes"] = try volumes.map { row in
+            var volume = try WorkspaceHostControl.object(row, keys: ["connection", "intent", "reopenRequired", "request", "authorizationConsumed", "lastJob", "operation", "message"])
+            volume["cleanupComplete"] = false; return volume
+        }
+        var state = try JSONDecoder().decode(WorkspaceDesiredState.self, from: JSONSerialization.data(withJSONObject: object))
+        for page in pages {
+            guard let bytes = Data(base64Encoded: page) else { throw WorkspaceControlError.grammar }
+            var frame = try WorkspaceControl.decode(bytes)
+            guard case .statusReply(let status) = frame.body else { throw WorkspaceControlError.grammar }
+            for mount in status.mounts + status.retired.filter(\.hasMountStatus).map(\.mountStatus) {
+                var single = status; single.mounts = [mount]; single.jobs = []; single.retired = []
+                frame.statusReply = single
+                try retain(mount, evidence: WorkspaceControl.encode(frame), state: &state)
+                for index in state.volumes.indices where (try state.volumes[index].request?.guestIdentity().mount) == mount.mount && mount.cleanup == "complete" {
+                    state.volumes[index].cleanupComplete = true
+                }
+            }
+        }
+        if let current = state.current {
+            let frame = try WorkspaceControl.decode(current)
+            guard case .statusReply(let status) = frame.body else { throw WorkspaceControlError.grammar }
+            confirmGuestRetirements(status, state: &state)
+        }
+        if witness == Data("8\nunobserved\n".utf8) {
+            let incarnation = state.execution?.boot ?? Data(SHA256.hash(data: raw).prefix(16))
+            guard WorkspaceControl.id(incarnation) else { throw WorkspaceControlError.grammar }
+            try retain(incarnation: incarnation, volume: "-", lost: false, unknown: true, evidence: nil, state: &state)
+        }
+        return state
     }
     public func commit(_ update: (inout WorkspaceDesiredState) throws -> Void) throws {
         var next = value; try update(&next)

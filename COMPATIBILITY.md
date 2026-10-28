@@ -10,8 +10,8 @@ Until then a gate failure can still change a detail here; such a change is
 made to this document and the code together, never silently.
 
 Protocol 8 replaces every earlier protocol. Nothing earlier shipped, so there
-is no older client, authority, Mac artifact, on-disk state, or release line to
-serve, convert, or refuse by name. An unequal version is refused because it is
+is no earlier-protocol client, authority, Mac artifact, on-disk state, or release
+line to serve, convert, or refuse by name. An unequal version is refused because it is
 unequal.
 
 If a surface is not listed here, treat it as internal and unstable.
@@ -591,9 +591,13 @@ an empty registry is never written as a file.
 ## Private state
 
 Repository-owned persistent state carries one exact format marker per owner
-and fails closed on a malformed or unequal marker. No historical decoder or
-migration exists; protocol-8 deployments are provisioned fresh. The markers
-are in the version table above. These formats are internal: a later change
+and fails closed on a malformed or unequal marker. The one prelaunch repair is
+workspace desired state 2 to 3, within protocol 8: validate main's exact publication,
+discard durably observed clean jobs, retain every exceptional mount outcome and
+carry its sticky unknown witness into an explicit notice before retiring that
+witness. Execution references and reservations survive. Only format 3 is emitted;
+malformed evidence and all other formats refuse unchanged. No earlier-protocol
+state is decoded. The markers are in the version table above. These formats are internal: a later change
 may introduce a new marker, and must then specify its own upgrade path.
 
 ## Changing a contract surface

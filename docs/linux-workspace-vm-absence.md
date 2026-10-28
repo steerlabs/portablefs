@@ -12,8 +12,11 @@ constructing the VM. WorkspaceState validates and adopts that same reference;
 it does not take a second lock. Private desired-state format 3 records its
 device/inode with the execution
 identity before VZ Start. A successor never substitutes a recreated inode for a
-same-boot execution. Unequal desired-state formats refuse; no historical decoder
-or conversion exists. Authority and paired workspace control remain protocol 8.
+same-boot execution. Main's unreleased protocol-8 desired state 2 has one explicit
+repair to format 3 for the full ordinary-job history defect. It validates every
+frame, keeps exceptional outcomes and the execution reference, and publishes the
+sticky unknown notice before retiring the old witness. Other formats or malformed
+evidence refuse unchanged. Authority and paired workspace control remain protocol 8.
 
 The same file handle becomes the writing handle of a dedicated, output-only
 `VZFileHandleSerialPortAttachment`. The immutable VM configuration retains this
