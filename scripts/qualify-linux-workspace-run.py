@@ -63,7 +63,7 @@ def cleanup_owned_resources(authority, guest, managed, peer, hold, status):
             if managed:authority.unmount(guest,managed)
         except Exception as error:status['errors'].append('unmount: '+repr(error))
     if guest is not None:
-        try:guest.stop()
+        try:status['guest_cleanup']=guest.stop()
         except Exception as error:status['errors'].append('guest stop: '+repr(error))
     if not hold.exists() and authority is not None:
         try:authority.close()
@@ -128,11 +128,16 @@ class Guest:
                                        'portablefs-workspace',command], text=True, timeout=30).strip()
 
     def stop(self):
+        outcome='already-exited'
         if self.p.poll() is None:
             self.command('stop')
             result = self.wait('stopped', 60)
-            assert result['operations'][-1] == 'shutdown-completed', result
+            outcome=result['operations'][-1]
+            # The dev owner reports both its graceful and bounded fallback
+            # power-off paths. Preserve which path occurred and require exit.
+            assert outcome in ('shutdown-completed','stop-completed'), result
         assert self.p.wait(timeout=10) == 0
+        return dict(outcome=outcome,graceful=outcome=='shutdown-completed',owner_returncode=0)
 
 
 def main():

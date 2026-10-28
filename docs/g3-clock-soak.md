@@ -85,3 +85,8 @@ stops, its evidence remains invalid/incomplete, and container cleanup is deferre
 The owner must not unpause, stop, kill, remove or replace a coordinator-paused
 container. A later explicit release authorizes cleanup and a new run, never
 continuation of the interrupted timer.
+
+After sampling ends, cleanup records whether the owned VM shut down gracefully
+or used the dev owner's bounded fallback stop. Both require the exact terminal
+operation and a zero exit from the owned process. A stop request alone or a
+nonzero exit remains a cleanup failure; fallback is never reported as graceful.

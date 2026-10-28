@@ -116,5 +116,21 @@ class SupportTests(unittest.TestCase):
         struct.pack_into('<Q',page,128,3)
         with self.assertRaises(RuntimeError):g3_product_rtc_reader.generation(page)
 
+    def test_guest_stop_requires_a_terminal_operation_and_zero_owner_exit(self):
+        import importlib.util
+        spec=importlib.util.spec_from_file_location('stop_owner',pathlib.Path(__file__).with_name('qualify-linux-workspace-run.py'))
+        owner=importlib.util.module_from_spec(spec);spec.loader.exec_module(owner)
+        for operation in ('shutdown-completed','stop-completed','shutdown-request'):
+            for code in (0,1):
+                with self.subTest(operation=operation,code=code):
+                    guest=owner.Guest.__new__(owner.Guest)
+                    guest.p=mock.Mock();guest.p.poll.return_value=None;guest.p.wait.return_value=code
+                    guest.command=mock.Mock();guest.wait=mock.Mock(return_value=dict(operations=[operation]))
+                    if operation=='shutdown-request' or code:
+                        with self.assertRaises(AssertionError):guest.stop()
+                    else:
+                        self.assertEqual(guest.stop(),dict(outcome=operation,graceful=operation=='shutdown-completed',owner_returncode=0))
+                        guest.p.wait.assert_called_once_with(timeout=10)
+
 
 if __name__=='__main__':unittest.main()
