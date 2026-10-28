@@ -7,11 +7,33 @@ import unittest
 from unittest import mock
 import g3_continuity
 import g3_product_rtc_reader
+from g3_local_authority import AuthorityTunnel
 
 
 class SupportTests(unittest.TestCase):
+    def test_local_authority_uses_only_vsock_and_loopback_and_preserves_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            guest=mock.Mock();guest.ready={'ssh_config':'owned-vsock-config'}
+            process=mock.Mock();process.poll.return_value=None
+            with mock.patch('g3_local_authority.subprocess.Popen',return_value=process) as start:
+                tunnel=AuthorityTunnel(guest,32123,pathlib.Path(directory))
+                command=start.call_args.args[0]
+                self.assertEqual(command[command.index('-R')+1],'127.0.0.1:17443:127.0.0.1:32123')
+                self.assertIn('ExitOnForwardFailure=yes',command)
+                self.assertNotIn('-O',command)
+                process.poll.return_value=1
+                with self.assertRaisesRegex(RuntimeError,'continuity lost'):tunnel.check()
+                tunnel.close();process.terminate.assert_not_called()
+            process.reset_mock();process.poll.return_value=None
+            with mock.patch('g3_local_authority.subprocess.Popen',return_value=process):
+                guest.ssh.side_effect=RuntimeError('forward unavailable')
+                with self.assertRaisesRegex(RuntimeError,'forward unavailable'):
+                    AuthorityTunnel(guest,32123,pathlib.Path(directory))
+                process.terminate.assert_called_once();process.wait.assert_called_once_with(timeout=5)
+
     def continuity(self,path):
         guard=g3_continuity.Continuity.__new__(g3_continuity.Continuity)
+        guard.authority=mock.Mock(tunnel=None)
         guard.host=(1000,2000)
         guard.initial={'pid':7,'started':'same','processes':{}}
         guard.snapshot=lambda:guard.initial

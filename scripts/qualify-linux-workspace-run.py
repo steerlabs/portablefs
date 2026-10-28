@@ -44,6 +44,8 @@ def write_status(evidence, status, body):
             f"Pinned UTC-source candidate and image commit: {status.get('candidate_commit','unknown')}.\n"
             f"Image manifest SHA-256: {status.get('image_manifest_sha256','unknown')}.\n"
             f"Guest system.ext4 SHA-256: {status.get('image_system_ext4_sha256','unknown')}.\n"
+            f"Guest page size: {status.get('guest_page_size','preparing')} bytes.\n"
+            "Authority TLS uses an owned VZ/vsock SSH reverse forward and host loopback, independent of Wi-Fi and DNS.\n"
             "This run qualifies the UTC source on that image. Later directory-cache and workspace RTC-sampling "
             "consolidation changes affect the admission path; the final candidate's admission behavior requires "
             "the native G0 inventory. This source run does not substitute for that inventory.\n\n")
@@ -166,6 +168,7 @@ def main():
     assert not (evidence/'status.json').exists(), 'use a new evidence directory'
     atomic(evidence/'run-inputs.json',pins)
     os.environ['PFS_NATIVE_CLOCK_SOAK'] = '1'
+    os.environ['PFS_NATIVE_LOCAL_AUTHORITY'] = '1'
     os.environ['PFS_NATIVE_FIXTURE_PREFIX'] = 'pfs-g3-soak-' if args.soak else 'pfs-g3-proof-'
     os.environ['PFS_RTC_NTS_REFERENCE'] = str(args.reference.resolve())
     os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
@@ -214,6 +217,12 @@ def main():
         require_unheld()
         authority = NativeAuthority(evidence)
         status['authority_container'] = authority.name
+        authority.connect_local(guest)
+        kernel = json.loads(guest.ssh("python3 -c \"import os,pathlib,json;print(json.dumps(dict(page_size=os.sysconf('SC_PAGE_SIZE'),cmdline=pathlib.Path('/proc/cmdline').read_text().strip())))\""))
+        assert kernel['page_size'] == pins['guest_page_size'] == 16384, kernel
+        assert 'oops=panic' in kernel['cmdline'].split(), kernel
+        status['guest_page_size'] = kernel['page_size']
+        atomic(evidence/'guest-kernel.json',kernel)
         managed = authority.mount(guest)
         authority.initial_io(guest)
         initial_probe=ProductProbe(guest,args.reference.resolve())

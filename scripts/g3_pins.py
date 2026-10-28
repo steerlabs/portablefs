@@ -4,7 +4,7 @@ import json
 import pathlib
 
 HARNESS = ('qualify-linux-workspace-clock.py','qualify-linux-workspace-run.py','g3_coverage.py',
-           'g3_continuity.py','g3_product_probe.py','g3_product_rtc_reader.py','g3_pins.py',
+           'g3_continuity.py','g3_local_authority.py','g3_product_probe.py','g3_product_rtc_reader.py','g3_pins.py',
            'linux_workspace_native_g0.py','linux_workspace_native_managed.py',
            'linux-workspace-native-authority.sh','test-linux-workspace-g0.sh',
            'test-linux-workspace-g0.swift','test-linux-workspace-rtc.sh','test-linux-workspace-rtc.swift',

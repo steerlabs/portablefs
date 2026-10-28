@@ -1,5 +1,15 @@
 # G3 clock-soak evidence
 
+The qualification owner publishes its authority on host loopback and carries
+the unchanged TLS connection through an owned SSH reverse forward over the
+existing VZ vsock transport. The guest endpoint is loopback, so this data path
+does not depend on external-interface addressing, routing or DNS. The ordinary
+peer still mounts independently inside the authority container. Tunnel exit,
+authority disruption and lost peer progress still invalidate the run. NTS
+references retain their external network dependency and all coverage rules.
+The owner verifies and records the running guest's 16,384-byte page size and
+`oops=panic` kernel argument before starting the sampling interval.
+
 The qualifier accepts one uninterrupted, host-awake 72-hour run. Its 8,640
 half-open 30-second slots are distinct from the closing observation. At least
 8,554 slots must contain authenticated, agreeing NTS evidence from two approved

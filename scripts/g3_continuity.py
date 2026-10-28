@@ -61,6 +61,9 @@ print(json.dumps(rows,sort_keys=True))
         return dict(pid=state['Pid'],started=state['StartedAt'],processes=json.loads(processes))
 
     def check(self, campaign_active=False):
+        tunnel = getattr(self.authority, 'tunnel', None)
+        if tunnel is not None:
+            tunnel.check()
         lower,upper=verify_awake(self.host,host_pair())
         if self.snapshot()!=self.initial:
             raise RuntimeError('authority/ordinary peer process identity changed')
