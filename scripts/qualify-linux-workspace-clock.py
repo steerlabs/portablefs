@@ -304,7 +304,7 @@ def main():
     p.add_argument('image', type=pathlib.Path)
     p.add_argument('ssh_config')
     p.add_argument('evidence', type=pathlib.Path)
-    p.add_argument('--seconds', type=float, default=65)
+    p.add_argument('--seconds', type=float, default=60)
     p.add_argument('--soak', action='store_true')
     p.add_argument('--dry-run', action='store_true')
     p.add_argument('--utc-reference-command')
