@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
 )
 
 type appendColdNotifier struct {
@@ -33,10 +34,14 @@ func (n *appendColdNotifier) EntryNotify(parent uint64, name string) fuse.Status
 }
 
 func TestWorkspaceKernelAppendBusyUnmountColdCut(t *testing.T) {
-	opusKernelParent(t, workspaceAppendColdCutChild)
+	for _, boundary := range []string{"subscription-sample", "source-assignment"} {
+		t.Run(boundary, func(t *testing.T) {
+			opusKernelParent(t, func(t *testing.T) { workspaceAppendColdCutChild(t, boundary) })
+		})
+	}
 }
 
-func workspaceAppendColdCutChild(t *testing.T) {
+func workspaceAppendColdCutChild(t *testing.T, boundary string) {
 	reader, proof, mounted := opusAdopt(t)
 	defer reader.Retire()
 	var off atomic.Int64
@@ -62,8 +67,20 @@ func workspaceAppendColdCutChild(t *testing.T) {
 	}
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
-	c.m.raw.beforeSourceAssignment = func(*sourcePublicationLease) {
-		once.Do(func() { close(entered); <-release })
+	var waitBulk, releaseBulk func()
+	if boundary == "source-assignment" {
+		c.m.raw.beforeSourceAssignment = func(*sourcePublicationLease) { once.Do(func() { close(entered); <-release }) }
+	} else {
+		var identity []byte
+		c.m.raw.mu.RLock()
+		for _, record := range c.m.raw.nodesByID {
+			if record.key.kind == authoritypb.Attr_REGULAR {
+				identity = cloneBytes(record.identity[:])
+				break
+			}
+		}
+		c.m.raw.mu.RUnlock()
+		waitBulk, releaseBulk = holdAppendBeforeSubscription(t, c.m, identity)
 	}
 	writes := f.counter.count("write")
 	done := make(chan error, 1)
@@ -74,16 +91,23 @@ func workspaceAppendColdCutChild(t *testing.T) {
 		}
 		done <- err
 	}()
-	select {
-	case <-entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("kernel append did not reach pre-assignment seam")
+	if waitBulk != nil {
+		waitBulk()
+	} else {
+		select {
+		case <-entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("kernel append did not reach pre-assignment seam")
+		}
 	}
 	serial, _ := strconv.ParseUint(c.req("close"), 10, 64)
 	close(release)
+	if releaseBulk != nil {
+		releaseBulk()
+	}
 	select {
 	case err := <-done:
-		t.Fatal("unassigned kernel append failed across Close", err)
+		t.Fatalf("unassigned kernel append failed across Close: %v; authority WRITE count before=%d after=%d", err, writes, f.counter.count("write"))
 	case <-time.After(25 * time.Millisecond):
 	}
 	if f.counter.count("write") != writes {

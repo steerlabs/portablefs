@@ -1627,6 +1627,11 @@ func (m *Mount) callMutation(ctx context.Context, request *authoritypb.Request, 
 		return nil, errors.New("fusev3: mutation has no subscription registry")
 	}
 	if (requiresGate || request.GetLookup() != nil) && m.subscription.stamp() == (subscriptionStamp{}) {
+		// A managed callback can outlive its serving permit while waiting for
+		// RPC capacity. Preserve that definite refusal before errno conversion.
+		if err := workspaceAcceptance(ctx); err != nil {
+			return nil, err
+		}
 		return nil, syscall.EIO
 	}
 	callback, _ := ctx.Value(mutationCallbackKey{}).(*mutationCallback)

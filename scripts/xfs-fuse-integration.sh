@@ -54,6 +54,7 @@ REQUIRED_TESTS=()
 REQUIRED_ROOT_TESTS=(
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceUnassignedAppendSurvivesColdCut"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceAppendRefusalsDoNotRetry"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceAppendDelegationAdmissionPreservesClosure"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceKernelAppendBusyUnmountColdCut"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceRTCFinalSampleRecapsLiveCachedTTL"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceRTCAcceptedMutationKeepsAssignedOutcome"
