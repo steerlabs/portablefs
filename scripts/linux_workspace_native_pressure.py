@@ -44,7 +44,7 @@ class MemoryPressureRecorder:
         self.finished = threading.Event()
         self.lock = threading.Lock()
         self.worker = None
-        self.sample('start')
+        self.sample('harness-start')
         self.thread = threading.Thread(target=self.run, name='workspace-pressure', daemon=True)
         self.thread.start()
 
@@ -99,4 +99,4 @@ class MemoryPressureRecorder:
         self.finished.set()
         self.thread.join(timeout=60)
         assert not self.thread.is_alive(), 'memory pressure sampler did not stop'
-        self.sample('end')
+        self.sample('harness-end')

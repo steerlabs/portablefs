@@ -162,6 +162,7 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         raise RuntimeError('throwaway SMAppService registration requires consent or failed: '+registered.stderr.strip()+'; fixture '+str(evidence/'product-fixture.json'))
     endpoint = home/'.local/state/portablefs/workspace/control.sock'
     def command(*args, success=True):
+        if args[0] == 'stop': pressure.sample('end')
         result = subprocess.run([str(cli),'workspace',*args],env=env,capture_output=True,text=True,timeout=40)
         if success: assert result.returncode == 0, (args,result.stdout,result.stderr)
         return result
@@ -171,11 +172,15 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         expected=1 if value['state'] in ('refused','busy','cleanup-required') else 0
         assert result.returncode==expected and value['version']==1, (result.returncode,value,result.stderr)
         return value
+    pressure_state = None
     def until(predicate, limit=180):
+        nonlocal pressure_state
         deadline=time.monotonic()+limit
         while time.monotonic()<deadline:
             try:
                 value=status()
+                if value['state'] == 'running' and pressure_state != 'running': pressure.sample('start')
+                pressure_state = value['state']
                 if predicate(value): return value
             except (AssertionError,json.JSONDecodeError): pass
             time.sleep(.1)

@@ -69,7 +69,7 @@ for number in range(1, args.cycles + 1):
                     assert event['event'] not in ('failure', 'eof'), event
 
             ready = wait('ready', 180)
-            pressure.sample('ready')
+            pressure.sample('start')
             ssh = ['/usr/bin/ssh', '-F', ready['ssh_config'], 'portablefs-workspace']
             actual = subprocess.check_output([*ssh, 'uname -r'], text=True, timeout=30).strip()
             assert actual == kernel, (actual, kernel)
@@ -78,7 +78,7 @@ for number in range(1, args.cycles + 1):
                                      stdout=log, stderr=subprocess.STDOUT, timeout=180)
             assert run.returncode == 0, ('workload failed', run.returncode)
             record['workload_completed'] = True
-            pressure.sample('stop-request')
+            pressure.sample('end')
             process.stdin.write('{"command":"stop"}\n'); process.stdin.flush()
             stopped = wait('stopped', 30)
             record['operations'] = stopped['operations']
