@@ -11,6 +11,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/steerlabs/portablefs/vcs/internal/authoritypb"
+	"github.com/steerlabs/portablefs/vcs/internal/writeback"
 )
 
 func directoryCacheReply(t *testing.T, raw *rawFileSystem, id, offset uint64, plus bool) uint64 {
@@ -622,4 +623,98 @@ func TestDirectoryCacheUnwrittenOpenReleasesOnlyItsLocalReference(t *testing.T) 
 			}
 		})
 	}
+}
+
+func TestDirectoryCacheSourceRetirementDefersQueueWaitBeyondCallbackFence(t *testing.T) {
+	f := newStockFixture(t)
+	f.mount.delegations.Stop()
+	manager, err := newDelegationManagerWithCloseCapacity(f.mount.rpc, time.Second, 1, writeback.Options{}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.mount.delegations, f.mount.subscription.control, manager.subscription = manager, manager, f.mount.subscription
+	entered, release := make(chan struct{}, 1), make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+	installAuthorityHook(f, func(q *authoritypb.Request) {
+		if q.GetCloseBatch() != nil {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			<-release
+		}
+	})
+	for i := uint64(20); i < 22; i++ {
+		owner, err := manager.reserveRetainedClose(delegationClose{identity: testIdentity(i), handle: testToken(i), epoch: manager.sessionSerial})
+		if err != nil {
+			t.Fatal(err)
+		}
+		owner.dispatch(context.Background())
+		if i == 20 {
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				t.Fatal("first cleanup did not start")
+			}
+		}
+	}
+	if len(manager.closeQueue) != cap(manager.closeQueue) {
+		t.Fatal("cleanup queue did not saturate")
+	}
+	root := f.raw.nodesByID[1]
+	backing := &directoryBacking{identity: root.identity, stamp: f.mount.subscription.stamp().withVersion(2), cached: true, pending: delegationClose{identity: cloneBytes(root.identity[:]), handle: testToken(22), epoch: manager.sessionSerial}}
+	f.raw.mu.Lock()
+	f.raw.directories.proofs[root.identity] = backing
+	f.raw.mu.Unlock()
+	u := nextTestRequestUnique()
+	ctx, finish, status := f.raw.mutationContext(u)
+	if status != fuse.OK {
+		t.Fatal(status)
+	}
+	gate, err := itemSourceGate(root.node.item, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callback := ctx.Value(mutationCallbackKey{}).(*mutationCallback)
+	lease, err := callback.acquireSource(ctx, f.raw, gate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = lease.markAssigned(); err != nil {
+		t.Fatal(err)
+	}
+	marked, finished := make(chan error, 1), make(chan struct{})
+	go func() { marked <- lease.markCallbackPublicationReady(ctx); finish(); close(finished) }()
+	select {
+	case err = <-marked:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("source retirement waited for queue capacity inside its callback fence")
+	}
+	waitUntil(t, time.Second, "callback fence released before queue dispatch", func() bool {
+		if f.mount.epochMu.TryLock() {
+			f.mount.epochMu.Unlock()
+			return true
+		}
+		return false
+	})
+	if pendingCloses(manager) != 3 || backing.cached {
+		t.Fatal("source retirement lost counted ownership before queue dispatch")
+	}
+	close(release)
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("callback did not finish after cleanup resumed")
+	}
+	completeTestReply(t, f.raw, u, fuse.OK)
+	waitUntil(t, time.Second, "retired proof cleanup", func() bool { return pendingCloses(manager) == 0 })
 }

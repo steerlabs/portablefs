@@ -167,7 +167,7 @@ func TestCompleteDirectoryPeerAndColdWithdrawalRemoveAbsenceProof(t *testing.T) 
 				}
 				lease.assigned = true
 				lease.resolveAllNoBinding()
-				if err := lease.markCallbackPublicationReady(); err != nil {
+				if err := lease.markCallbackPublicationReady(context.Background()); err != nil {
 					t.Fatal(err)
 				}
 				lease.release()

@@ -180,7 +180,7 @@ func completeSourcePublication(ctx context.Context) error {
 		lease.completeProof.stamp = stamp
 	}
 	lease.r.mu.Unlock()
-	if err := lease.markCallbackPublicationReady(); err != nil {
+	if err := lease.markCallbackPublicationReady(ctx); err != nil {
 		return err
 	}
 	return nil

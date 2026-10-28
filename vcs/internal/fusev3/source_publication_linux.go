@@ -592,7 +592,7 @@ func (l *sourcePublicationLease) markDefiniteNoChange() error {
 // publication lease and its physically written callback reply are the sole
 // local commit boundary. Reopening early would leave old local state
 // serviceable with no later withdrawal to take it back.
-func (l *sourcePublicationLease) markCallbackPublicationReady() error {
+func (l *sourcePublicationLease) markCallbackPublicationReady(ctx context.Context) error {
 	if l == nil {
 		return nil
 	}
@@ -631,7 +631,7 @@ func (l *sourcePublicationLease) markCallbackPublicationReady() error {
 	// Directory cursor locks must never nest inside the inode-table lock. The
 	// source gate stays closed while buffered pages and in-flight fetches retire.
 	l.r.mu.Unlock()
-	l.r.flushDirectoryRetirements(context.Background())
+	l.r.flushDirectoryRetirements(ctx)
 	for _, directory := range directories {
 		directory.invalidateEnumeration()
 	}

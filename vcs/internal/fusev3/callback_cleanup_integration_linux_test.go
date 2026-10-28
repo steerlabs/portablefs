@@ -121,13 +121,24 @@ func TestStaleCreateCallbackHistoryPrecedesColdReset(t *testing.T) {
 					if !status.Ok() {
 						t.Fatal(status)
 					}
-					h, _, errno := root.node.OpendirHandle(ctx, syscall.O_RDONLY)
+					// Queue saturation requires three independently owned
+					// authority descriptions. Reusable directory proofs would
+					// legitimately share one description across these opens.
+					response, errno := root.node.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Item: cloneBytes(root.node.item.GetToken()), Flags: &authoritypb.OpenFlags{Read: true}}}})
+					var owner *descriptorCleanup
+					if errno == 0 {
+						owner, err = mount.ownDescriptor(root.identity[:], response.GetOpen().GetHandle())
+					}
 					finish()
 					completeTestReply(t, raw, scratchUnique, fuse.OK)
 					if errno != 0 {
 						t.Fatal(errno)
 					}
-					scratch = append(scratch, h)
+					if err != nil {
+						t.Fatal(err)
+					}
+					scratch = append(scratch, &dirHandle{node: root.node, token: cloneBytes(response.GetOpen().GetHandle())})
+					owner.transfer()
 				}
 			}
 			accepted, deliver := make(chan struct{}), make(chan struct{})

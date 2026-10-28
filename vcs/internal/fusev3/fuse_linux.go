@@ -3243,7 +3243,7 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 				if cut.Sequence == 0 {
 					transitionErr = completeDefiniteNoChangePublication(ctx)
 				} else {
-					transitionErr = lease.markCallbackPublicationReady()
+					transitionErr = lease.markCallbackPublicationReady(ctx)
 				}
 				if transitionErr != nil {
 					n.mount.revoke(fmt.Errorf("fusev3: settle delegated SETATTR refusal: %w", transitionErr))
@@ -3253,7 +3253,7 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 			return bufferErrno(admissionErr)
 		}
 		if err := n.invalidateOwnData(ctx, 0, 0); err != nil {
-			if transitionErr := lease.markCallbackPublicationReady(); transitionErr != nil {
+			if transitionErr := lease.markCallbackPublicationReady(ctx); transitionErr != nil {
 				n.mount.revoke(fmt.Errorf("fusev3: settle accepted SETATTR after invalidation failure: %w", transitionErr))
 			}
 			return syscall.EIO
