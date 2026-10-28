@@ -52,6 +52,10 @@ REQUIRED_TESTS=()
 # deleted test from masquerading as qualification; validate_root_tests refuses
 # an empty or malformed list before any test selector is built.
 REQUIRED_ROOT_TESTS=(
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceUnassignedAppendSurvivesColdCut"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceAppendRefusalsDoNotRetry"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceAppendDelegationAdmissionPreservesClosure"
+  "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceKernelAppendBusyUnmountColdCut"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceRTCFinalSampleRecapsLiveCachedTTL"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceRTCAcceptedMutationKeepsAssignedOutcome"
   "github.com/steerlabs/portablefs/vcs/internal/fusev3:TestWorkspaceRTCRenewalSampleCannotInstallAcrossNewClose"

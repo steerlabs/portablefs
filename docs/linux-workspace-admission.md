@@ -66,6 +66,10 @@ retiring that callback attempt, including its old cohort, source and response
 owners. The original FUSE request remains unanswered outside the epoch reader
 until fresh admission. No physical reply is invented. A nonzero accepted cut,
 filesystem post-state or independent failure cannot take this transition.
+Append uses the same rule before replay assignment, including closure observed
+while sampling the subscription after an RPC-capacity wait. Preserve the exact
+admission refusal before converting it to a POSIX errno; neither an authority
+errno nor an assigned append can retire as an unsubmitted attempt.
 
 A drain permit captures one old buffer, its incarnation and the earlier of the
 requested deadline and local cache-withdrawal deadline, preserving its lead
