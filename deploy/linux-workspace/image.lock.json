@@ -6,7 +6,7 @@
   "source_date_epoch": 1790812800,
   "builder": "debian@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad",
   "include": [
-    "linux-image-arm64",
+    "linux-image-arm64-16k",
     "initramfs-tools",
     "systemd-sysv",
     "systemd-resolved",
@@ -1676,7 +1676,7 @@
     },
     {
       "built_using": "linux (= 6.12.113-1)",
-      "package": "linux-image-6.12.113+deb13-arm64",
+      "package": "linux-image-6.12.113+deb13-arm64-16k",
       "source": "linux-signed-arm64",
       "source_version": "6.12.113+1",
       "static_built_using": "",
@@ -1684,7 +1684,7 @@
     },
     {
       "built_using": "",
-      "package": "linux-image-arm64",
+      "package": "linux-image-arm64-16k",
       "source": "linux-signed-arm64",
       "source_version": "6.12.113+1",
       "static_built_using": "",
@@ -4880,7 +4880,7 @@
     "filename": "go1.26.10.src.tar.gz",
     "sha256": "fd63e883ba2f2bfca93c1646b31ebef63e2b1e4d2b317c9789d976a68d81f36f"
   },
-  "kernel_release": "6.12.113+deb13-arm64",
+  "kernel_release": "6.12.113+deb13-arm64-16k",
   "sources": [
     {
       "files": {

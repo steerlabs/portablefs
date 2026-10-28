@@ -13,7 +13,8 @@ sys.path.insert(0, str(repo / 'deploy/linux-workspace'))
 from redistribute import digest, write
 
 original = pathlib.Path(sys.argv[1]).resolve()
-for field, expected in [('debian', 'incomplete Debian source coverage'), ('notice', 'missing notice:')]:
+for field, expected in [('debian', 'incomplete Debian source coverage'), ('notice', 'missing notice:'),
+                        ('page-size', 'expected 16 KiB arm64 Image')]:
     with tempfile.TemporaryDirectory(prefix='coverage-', dir=original.parent) as temp:
         out = pathlib.Path(temp)
         manifest = json.loads((original / 'manifest.json').read_text())
@@ -25,7 +26,7 @@ for field, expected in [('debian', 'incomplete Debian source coverage'), ('notic
         sources = json.loads((original / 'source-manifest.json').read_text())
         if field == 'debian':
             sources[field].pop()
-        else:
+        elif field == 'notice':
             notice = next(iter(sources['notices'].values()))
             del sources['notice_files'][notice]
             target = out / 'licenses.tar.gz'
@@ -35,6 +36,14 @@ for field, expected in [('debian', 'incomplete Debian source coverage'), ('notic
                     if member.name != notice:
                         tar.addfile(member, source.extractfile(member))
             manifest['files']['licenses.tar.gz'] = digest(target)
+        else:
+            # A resealed 4 KiB Image must fail even with intact source/notices.
+            kernel = bytearray((out / 'kernel').read_bytes())
+            flags = int.from_bytes(kernel[24:32], 'little')
+            kernel[24:32] = ((flags & ~6) | 2).to_bytes(8, 'little')
+            (out / 'kernel').unlink()
+            (out / 'kernel').write_bytes(kernel)
+            manifest['files']['kernel'] = digest(out / 'kernel')
         write(out / 'source-manifest.json', sources)
         manifest['files']['source-manifest.json'] = digest(out / 'source-manifest.json')
         write(out / 'manifest.json', manifest)

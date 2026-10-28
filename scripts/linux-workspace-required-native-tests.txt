@@ -8,6 +8,9 @@ ssh-user-manager-linger
 ssh-background-disconnect
 ssh-background-stop
 guest-development-toolchain
+guest-16k-page-size
+guest-16k-userspace-builds
+managed-large-repository-read-stress
 immutable-root
 vsock-only-ssh
 workspace-root-layout
@@ -26,7 +29,6 @@ rtc-awake-measurement
 managed-standalone-provision
 managed-write-read-fsync
 managed-peer-coherence
-managed-large-repository-read-stress
 managed-suspend-resume-data
 managed-unmount-exact-cleanup
 managed-channel-loss-vm-discard
@@ -162,3 +164,6 @@ service-crash-same-boot-recovery
 service-crash-reconcile-unknown-retained
 service-loss-accepted-tail-peer
 service-loss-retained-after-clean-stop
+service-panic-fail-stop
+service-panic-no-ram-adoption
+service-panic-outcomes-retained

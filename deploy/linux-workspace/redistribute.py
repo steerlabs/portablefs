@@ -273,6 +273,11 @@ def check(out):
     debian = {(p['package'], p['version']): p for p in sources['debian']}
     assert len(debian) == len(sources['debian']) and set(debian) == required_sources(packages), 'incomplete Debian source coverage'
     assert set(sources['notices']) == {p['package'] for p in packages}, 'incomplete Debian notice coverage'
+    with (out / 'kernel').open('rb') as kernel:
+        header = kernel.read(64)
+    assert header[56:60] == b'ARM\x64', 'expected arm64 Image'
+    assert (int.from_bytes(header[24:32], 'little') >> 1) & 3 == 2, 'expected 16 KiB arm64 Image'
+    assert 'CONFIG_ARM64_16K_PAGES=y\n' in (out / 'kernel.config').read_text(), 'expected 16 KiB kernel config'
     assert inputs['lock']['packages'] == packages, 'binary inventory differs from recipe lock'
     assert inputs['lock']['sources'] == sources['debian'], 'source inventory differs from recipe lock'
     assert inputs['lock']['go'] == sources['go']['runtime'], 'Go source differs from recipe lock'

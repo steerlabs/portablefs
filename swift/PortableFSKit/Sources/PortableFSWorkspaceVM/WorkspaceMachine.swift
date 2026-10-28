@@ -44,7 +44,7 @@ import PortableFSWorkspaceCore
         let config = VZVirtualMachineConfiguration()
         let boot = VZLinuxBootLoader(kernelURL: artifact.directory.appendingPathComponent("kernel"))
         boot.initialRamdiskURL = artifact.directory.appendingPathComponent("initramfs")
-        boot.commandLine = "console=hvc0 root=/dev/vda ro rootfstype=ext4 panic=-1 systemd.show_status=1 systemd.machine_id=\(machineID)"
+        boot.commandLine = "console=hvc0 root=/dev/vda ro rootfstype=ext4 oops=panic panic=-1 systemd.show_status=1 systemd.machine_id=\(machineID)"
         config.bootLoader = boot
         config.platform = VZGenericPlatformConfiguration()
         let large = ProcessInfo.processInfo.physicalMemory >= 16 * 1024 * 1024 * 1024

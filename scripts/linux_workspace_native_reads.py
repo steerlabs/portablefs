@@ -4,10 +4,11 @@ import pathlib
 import shlex
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from linux_workspace_native_hold import hold_between_cases
 
 
-def read_checks(authority, guest, evidence, record, rounds=20):
+def read_checks(authority, guest, evidence, record, rounds=20, stress_work=None):
     evidence = pathlib.Path(evidence)
     evidence.mkdir(parents=True, exist_ok=True)
     hold_between_cases(restart_on_release=True)
@@ -57,18 +58,23 @@ print(json.dumps({'files':31500,'matches':3150,'directories':6363}))
     commands = [('rg', 'rg -l TODO .'), ('git-status', 'GIT_OPTIONAL_LOCKS=0 git -c safe.directory=' +
         shlex.quote(target) + ' status --porcelain')]
     rows = []
-    for iteration in range(rounds):
-        for name, command in commands:
-            hold_between_cases(restart_on_release=True)
-            started = time.monotonic()
-            result = subprocess.run([*ssh, 'cd ' + shlex.quote(target) + ' && ' + command],
-                stdin=subprocess.DEVNULL, text=True, capture_output=True, timeout=600)
-            row = {'iteration':iteration, 'command':name, 'seconds':time.monotonic()-started,
-                'returncode':result.returncode, 'lines':len(result.stdout.splitlines()), 'stderr':result.stderr}
-            rows.append(row)
-            (evidence / 'read-stress.json').write_text(json.dumps({'fixture':expected, 'rounds':rounds, 'runs':rows}, indent=2) + '\n')
-            assert result.returncode == 0 and not result.stderr, row
-            assert row['lines'] == (expected['matches'] if name == 'rg' else 0), row
+    # The overnight campaign overlaps its requested Redis build with the
+    # strict rounds, after fixture setup and the index refresh have finished.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        load = pool.submit(stress_work) if stress_work else None
+        for iteration in range(rounds):
+            for name, command in commands:
+                hold_between_cases(restart_on_release=True)
+                started = time.monotonic()
+                result = subprocess.run([*ssh, 'cd ' + shlex.quote(target) + ' && ' + command],
+                    stdin=subprocess.DEVNULL, text=True, capture_output=True, timeout=600)
+                row = {'iteration':iteration, 'command':name, 'seconds':time.monotonic()-started,
+                    'returncode':result.returncode, 'lines':len(result.stdout.splitlines()), 'stderr':result.stderr}
+                rows.append(row)
+                (evidence / 'read-stress.json').write_text(json.dumps({'fixture':expected, 'rounds':rounds, 'runs':rows}, indent=2) + '\n')
+                assert result.returncode == 0 and not result.stderr, row
+                assert row['lines'] == (expected['matches'] if name == 'rg' else 0), row
+        if load: load.result()
     record('managed-large-repository-read-stress')
     # Namespace cleanup also crosses the real mount rather than backing storage.
     authority.peer("import shutil;shutil.rmtree('/var/tmp/pfs-native/home/peer/read-stress');shutil.rmtree('/var/tmp/pfs-native/home/read-stress-source')")

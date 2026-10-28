@@ -20,6 +20,8 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from linux_workspace_native_editors import editor_checks
 from linux_workspace_native_hold import hold_between_cases
+from linux_workspace_native_pressure import MemoryPressureRecorder
+from linux_workspace_native_panic import install_panic_fixture
 
 
 def execution_reference_busy(path):
@@ -44,7 +46,7 @@ def execution_reference_worker(path):
 
 
 def product_checks(image, evidence, record, authority=None, api_only=False, defer_ui=False, defer_case=None, outcome_case='crash'):
-    assert outcome_case in ('crash','loss','removal') and (outcome_case!='loss' or authority is not None)
+    assert outcome_case in ('crash','loss','removal','panic') and (outcome_case not in ('loss','panic') or authority is not None)
     # Removal changes registration history. Fresh identities keep its teardown
     # separate from the crash and loss controls inherited from the service gate.
     ux = {'service-app-api-client','service-managed-ssh-config','service-two-ssh-agents',
@@ -55,9 +57,10 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
           'service-background-consent-denied'}
     if not api_only:
         observe=record
-        if outcome_case=='loss': record=lambda name:observe(name) if name.startswith('service-loss-') else None
+        if outcome_case=='panic': record=lambda name:observe(name) if name.startswith('service-panic-') else None
+        elif outcome_case=='loss': record=lambda name:observe(name) if name.startswith('service-loss-') else None
         elif outcome_case=='removal': record=lambda name:observe(name) if name in ux else None
-        else: record=lambda name:observe(name) if name not in ux and not name.startswith('service-loss-') else None
+        else: record=lambda name:observe(name) if name not in ux and not name.startswith(('service-loss-','service-panic-')) else None
     repo = pathlib.Path(__file__).resolve().parent.parent
     evidence = pathlib.Path(evidence)
     evidence.mkdir(parents=True, exist_ok=True)
@@ -66,6 +69,8 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
     # Faults operate only on this invocation's image, including after a crash.
     test_image = root/'image'
     subprocess.run(['/bin/cp', '-cR', str(pathlib.Path(image).resolve()), str(test_image)], check=True)
+
+    if outcome_case == 'panic': install_panic_fixture(test_image, evidence)
 
     app = root/'PortableFS Workspace Test.app'
     contents = app/'Contents'
@@ -157,6 +162,7 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         raise RuntimeError('throwaway SMAppService registration requires consent or failed: '+registered.stderr.strip()+'; fixture '+str(evidence/'product-fixture.json'))
     endpoint = home/'.local/state/portablefs/workspace/control.sock'
     def command(*args, success=True):
+        if args[0] == 'stop': pressure.sample('end')
         result = subprocess.run([str(cli),'workspace',*args],env=env,capture_output=True,text=True,timeout=40)
         if success: assert result.returncode == 0, (args,result.stdout,result.stderr)
         return result
@@ -166,16 +172,21 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         expected=1 if value['state'] in ('refused','busy','cleanup-required') else 0
         assert result.returncode==expected and value['version']==1, (result.returncode,value,result.stderr)
         return value
+    pressure_state = None
     def until(predicate, limit=180):
+        nonlocal pressure_state
         deadline=time.monotonic()+limit
         while time.monotonic()<deadline:
             try:
                 value=status()
+                if value['state'] == 'running' and pressure_state != 'running': pressure.sample('start')
+                pressure_state = value['state']
                 if predicate(value): return value
             except (AssertionError,json.JSONDecodeError): pass
             time.sleep(.1)
         last=command('status','--json',success=False)
         raise AssertionError('product status deadline: '+last.stdout+' '+last.stderr)
+    pressure = MemoryPressureRecorder(evidence/'host-memory-pressure.jsonl', home/'.local/state/portablefs/workspace/owner.lock')
     crashed=False
     confirmed_absent=False
     finished=False
@@ -184,8 +195,11 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
         if success: assert result.returncode==0,(args,result.stdout,result.stderr)
         return result
     def snapshot(name):
+        pressure.sample(name)
         value=status()
         (evidence/('menu-'+name+'.json')).write_text(json.dumps(value,indent=2))
+        serial = home/'.local/state/portablefs/workspace/serial.log'
+        if serial.exists(): shutil.copyfile(serial, evidence/(name+'-serial.log'))
         return value
     try:
         deadline=time.monotonic()+30
@@ -393,7 +407,7 @@ def product_checks(image, evidence, record, authority=None, api_only=False, defe
             return
         command('start');until(lambda s:s['state']=='running')
         if authority is not None: mount_volume()
-        if outcome_case=='loss':
+        if outcome_case in ('loss', 'panic'):
             payload=b'accepted-before-expiry'
             script="""import errno,json,os
 f=os.open('/workspaces/native-managed/loss-proof',os.O_CREAT|os.O_TRUNC|os.O_WRONLY,0o600)
@@ -449,38 +463,61 @@ print(json.dumps({'fsync_errno':fsync_error,'close_errno':close_error}),flush=Tr
             assert refused.returncode!=0 and 'Some changes were not saved' in refused.stderr
             prepare_update('Some changes were not saved')
             record('service-loss-retained-after-clean-stop')
-            finished=True
-            return
+            if outcome_case == 'loss':
+                finished=True
+                return
+            command('start');until(lambda s:s['state']=='running')
+            mount_volume()
         old_boot=ssh('cat /proc/sys/kernel/random/boot_id')
         if authority is not None:
             assert ssh('cat /workspaces/native-managed/product-proof')=='product-volume'
         reference=home/'.local/state/portablefs/workspace/owner.lock'
         worker,observed=execution_reference_worker(reference)
         assert execution_reference_busy(reference)
-        suspended=False
-        try:
-            os.kill(worker,signal.SIGSTOP);suspended=True
-            # Signal delivery must settle before the owner-death control.
-            deadline=time.monotonic()+5
-            while True:
-                stopped=subprocess.check_output(['ps','-p',str(worker),'-o','state='],text=True).strip()
-                if stopped.startswith('T'): break
-                assert time.monotonic()<deadline, 'VM worker did not acknowledge SIGSTOP'
-                time.sleep(.01)
-            (evidence/'worker-paused.json').write_text(json.dumps({'worker':worker,'state':stopped,'lsof':observed},indent=2))
-            subprocess.run(['launchctl','kill','SIGKILL',f'gui/{os.getuid()}/{label}'],check=True)
-            crashed=True
-            refused=until(lambda s:s['state']=='cleanup-required')
-            assert command('start',success=False).returncode!=0
-            assert execution_reference_busy(reference)
-            (evidence/'crash-worker-held.json').write_text(json.dumps({'worker':worker,'lsof':observed,'status':refused},indent=2))
-            record('service-crash-live-worker-refusal')
-        finally:
-            hold_between_cases()
-            if suspended:
-                try: os.kill(worker,signal.SIGCONT)
-                except ProcessLookupError: pass
-
+        if outcome_case == 'panic':
+            assert ssh('getconf PAGESIZE; cat /proc/sys/kernel/panic_on_oops').splitlines() == ['16384', '1']
+            before_panic = snapshot('before-panic')
+            trigger = subprocess.run(['ssh','-F',str(config),'portablefs-workspace',
+                                     'touch /home/workspace/.pfs-native-panic'],
+                                    env=env, capture_output=True, text=True, timeout=30)
+            (evidence/'panic-trigger.json').write_text(json.dumps({
+                'returncode': trigger.returncode, 'stdout': trigger.stdout, 'stderr': trigger.stderr}, indent=2))
+            failed = until(lambda s:s['state']=='cleanup-required' and s['previousWriteOutcomeUnknown'], 45)
+            serial = home/'.local/state/portablefs/workspace/serial.log'
+            shutil.copyfile(serial, evidence/'panic-serial.log')
+            text = serial.read_text(errors='replace')
+            assert 'sysrq: Trigger a crash' in text and 'Kernel panic - not syncing:' in text, text[-12000:]
+            assert 'sysrq triggered crash' in text and 'sysrq_handle_crash' in text, text[-12000:]
+            assert 'shutdown-completed' not in text
+            assert failed['desiredRunning'] and failed['retainedEvidence'], failed
+            assert failed['someChangesWereNotSaved'], failed
+            assert set(before_panic['retainedEvidence']) <= set(failed['retainedEvidence']), failed
+            (evidence/'panic-stopped.json').write_text(json.dumps(failed,indent=2))
+            record('service-panic-fail-stop')
+        else:
+            suspended=False
+            try:
+                os.kill(worker,signal.SIGSTOP);suspended=True
+                # Signal delivery must settle before the owner-death control.
+                deadline=time.monotonic()+5
+                while True:
+                    stopped=subprocess.check_output(['ps','-p',str(worker),'-o','state='],text=True).strip()
+                    if stopped.startswith('T'): break
+                    assert time.monotonic()<deadline, 'VM worker did not acknowledge SIGSTOP'
+                    time.sleep(.01)
+                (evidence/'worker-paused.json').write_text(json.dumps({'worker':worker,'state':stopped,'lsof':observed},indent=2))
+                subprocess.run(['launchctl','kill','SIGKILL',f'gui/{os.getuid()}/{label}'],check=True)
+                crashed=True
+                refused=until(lambda s:s['state']=='cleanup-required')
+                assert command('start',success=False).returncode!=0
+                assert execution_reference_busy(reference)
+                (evidence/'crash-worker-held.json').write_text(json.dumps({'worker':worker,'lsof':observed,'status':refused},indent=2))
+                record('service-crash-live-worker-refusal')
+            finally:
+                hold_between_cases()
+                if suspended:
+                    try: os.kill(worker,signal.SIGCONT)
+                    except ProcessLookupError: pass
         deadline=time.monotonic()+30
         while execution_reference_busy(reference):
             assert time.monotonic()<deadline, 'VM worker retained execution reference after owner death'
@@ -493,6 +530,7 @@ print(json.dumps({'fsync_errno':fsync_error,'close_errno':close_error}),flush=Tr
         assert (home/'.local/state/portablefs/workspace/client_ed25519.pub').read_bytes()==before
         record('service-crash-same-boot-recovery')
         record('service-crash-no-ram-adoption')
+        if outcome_case == 'panic': record('service-panic-no-ram-adoption')
         if authority is not None:
             mount_volume()
             assert ssh('cat /workspaces/native-managed/product-proof')=='peer-after-owner-crash'
@@ -503,9 +541,18 @@ print(json.dumps({'fsync_errno':fsync_error,'close_errno':close_error}),flush=Tr
             assert settled['previousWriteOutcomeUnknown'],settled
             (evidence/'crash-reconciled-unknown.json').write_text(json.dumps(settled,indent=2))
             record('service-crash-reconcile-unknown-retained')
-        prepare_update('Previous write outcome unknown')
+            if outcome_case == 'panic':
+                assert settled['someChangesWereNotSaved'], settled
+                # Main persists exact retired pages append-only before ACK; a
+                # fresh boot cannot rewrite them. docs/linux-workspace.md:
+                # 'preserving prior outcomes' and 'A subsequent clean boot
+                # does not erase that earlier uncertainty.'
+                assert set(failed['retainedEvidence']) <= set(settled['retainedEvidence']), settled
+                record('service-panic-outcomes-retained')
+        retained_reason = 'Some changes were not saved' if outcome_case == 'panic' else 'Previous write outcome unknown'
+        prepare_update(retained_reason)
         refused=app_command('--workspace-remove','delete',success=False)
-        assert refused.returncode!=0 and 'Previous write outcome unknown' in refused.stderr
+        assert refused.returncode!=0 and retained_reason in refused.stderr
         snapshot('cleanup')
         record('service-removal-unknown-refusal')
         crashed=False
@@ -522,6 +569,9 @@ print(json.dumps({'fsync_errno':fsync_error,'close_errno':close_error}),flush=Tr
                 confirmed_absent=True
             except Exception as error:
                 (evidence/'cleanup-unconfirmed.txt').write_text(str(error)+'\n')
+        pressure.close()
+        serial = home/'.local/state/portablefs/workspace/serial.log'
+        if serial.exists(): shutil.copyfile(serial, evidence/'guest-final-serial.log')
         subprocess.run([str(host),'--unregister-workspace-test'],env=env,check=True,capture_output=True,text=True)
         subprocess.run([lsregister,'-u',str(app)],check=True)
         if confirmed_absent and finished: shutil.rmtree(root)
@@ -546,6 +596,7 @@ if __name__=='__main__':
         if not api_only:
             product_checks(image,evidence/'product-removal',lambda name:(observed.append(name),print('PASS:',name,flush=True)),authority=authority,outcome_case='removal',defer_ui=defer_ui,defer_case=lambda name:(not_run.append(name),print('NOT RUN (UI deferred):',name,flush=True)))
             product_checks(image,evidence/'product-loss',lambda name:(observed.append(name),print('PASS:',name,flush=True)),authority=authority,outcome_case='loss',defer_ui=True,defer_case=lambda name:None)
+            product_checks(image,evidence/'product-panic',lambda name:(observed.append(name),print('PASS:',name,flush=True)),authority=authority,outcome_case='panic',defer_ui=True,defer_case=lambda name:None)
         assert sorted(observed+not_run)==sorted(required),(observed,not_run,required)
         (evidence/'product-results.json').write_text(json.dumps({'required':required,'passed':observed,'notRun':not_run,
             'scope':'api-only' if api_only else 'product','qualified':not not_run and not api_only},indent=2))
