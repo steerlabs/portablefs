@@ -403,10 +403,16 @@ func writeFrameBulk(w io.Writer, max uint32, message proto.Message, segments [][
 func frameBulkCarrier(message proto.Message) (*[]byte, error) {
 	switch typed := message.(type) {
 	case *authoritypb.Request:
+		if typed.GetOpen().GetReusableDirectoryReadIncarnation() != 0 && !validDirectoryReadRequest(typed.GetOpen()) {
+			return nil, fmt.Errorf("%w: invalid reusable directory open", ErrFrameEncoding)
+		}
 		if write := typed.GetWrite(); write != nil {
 			return &write.Data, nil
 		}
 	case *authoritypb.Response:
+		if typed.GetOpen().GetDirectoryReadProof() != nil && !validDirectoryReadProof(typed) {
+			return nil, fmt.Errorf("%w: invalid directory read proof", ErrFrameEncoding)
+		}
 		if proof := typed.GetSessionValidForNanos(); proof != 0 &&
 			(proof > uint64(MaxCacheProof) || proof%uint64(time.Millisecond) != 0 || !keepAliveSucceeded(typed)) {
 			return nil, fmt.Errorf("%w: invalid KeepAlive validity proof", ErrFrameEncoding)

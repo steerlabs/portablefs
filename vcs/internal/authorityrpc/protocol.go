@@ -133,6 +133,9 @@ func requestAllowedForFrontend(req *authoritypb.Request, profile authoritypb.Fro
 	if req == nil {
 		return false
 	}
+	if req.GetOpen().GetReusableDirectoryReadIncarnation() != 0 && (profile != authoritypb.FrontendProfile_FRONTEND_PROFILE_LINUX || !validDirectoryReadRequest(req.GetOpen())) {
+		return false
+	}
 	common := func() bool {
 		switch req.GetBody().(type) {
 		case *authoritypb.Request_Hello, *authoritypb.Request_Attach,

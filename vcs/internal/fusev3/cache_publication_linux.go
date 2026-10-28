@@ -19,7 +19,7 @@ func (r *rawFileSystem) closeCacheCoordinates(ctx context.Context, coordinates [
 	for _, coordinate := range coordinates {
 		set[coordinate] = struct{}{}
 	}
-	lease := &cacheWithdrawalLease{raw: r, coordinates: make([]publicationCoordinate, 0, len(set))}
+	lease := &cacheWithdrawalLease{raw: r, coordinates: make([]publicationCoordinate, 0, len(set)), started: time.Now()}
 	r.mu.Lock()
 	pending := make([]<-chan struct{}, 0)
 	candidates := make(map[*replyPublication]struct{})
@@ -77,6 +77,14 @@ func (r *rawFileSystem) closeCacheCoordinates(ctx context.Context, coordinates [
 func publicationInstallsCoordinate(publication *replyPublication, coordinate publicationCoordinate) bool {
 	if publication == nil {
 		return false
+	}
+	for _, fill := range publication.directoryFills {
+		if fill.reservation != nil && fill.reservation.coordinate == coordinate {
+			return true
+		}
+	}
+	if proof := publication.directoryProof; proof != nil && coordinate == (publicationCoordinate{kind: publicationItemAttributes, item: proof.backing.identity}) {
+		return true
 	}
 	for _, cached := range publication.cachedCoordinates[:publication.cachedCount] {
 		if cached == coordinate {
@@ -163,6 +171,7 @@ type cacheWithdrawalLease struct {
 	raw         *rawFileSystem
 	coordinates []publicationCoordinate
 	once        sync.Once
+	started     time.Time
 }
 
 func (lease *cacheWithdrawalLease) Open() {
@@ -173,6 +182,8 @@ func (lease *cacheWithdrawalLease) Open() {
 		r := lease.raw
 		r.mu.Lock()
 		defer r.mu.Unlock()
+		r.directories.withdrawals++
+		r.directories.withdrawalNanos += uint64(time.Since(lease.started))
 		for _, coordinate := range lease.coordinates {
 			owners := r.withdrawalOwners[coordinate]
 			if _, present := owners[lease]; !present {

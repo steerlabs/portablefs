@@ -130,6 +130,7 @@ go -C vcs/third_party/go-fuse test -race ./fuse -run 'Test(MountReadyBootstrapDo
 
 # 5. The native observer's evidence rules need no mount or platform privilege.
 step "native cache observer evidence"
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_benchmark_linux_metadata.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_macos27_kernel_cache_observer.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_writeback_probes.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_qualify_linux_workspace_clock.py

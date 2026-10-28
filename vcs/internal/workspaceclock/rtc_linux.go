@@ -6,12 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-type RTC struct{ file *os.File }
+type RTC struct {
+	file                   *os.File
+	reads, nanos, failures atomic.Uint64
+}
 
 // Open pins the sole RTC opening for the owner's lifetime. Never reopen on an
 // ioctl failure: rtc_dev_open's busy bit makes per-mount openings invalid.
@@ -33,7 +37,15 @@ func Open(unavailable func()) (*Owner, error) {
 	}
 	return owner, nil
 }
-func (r *RTC) ReadUTC() (time.Time, error) {
+func (r *RTC) ReadUTC() (result time.Time, failure error) {
+	started := time.Now()
+	defer func() {
+		r.reads.Add(1)
+		r.nanos.Add(uint64(time.Since(started)))
+		if failure != nil {
+			r.failures.Add(1)
+		}
+	}()
 	raw, err := unix.IoctlGetRTCTime(int(r.file.Fd()))
 	if err != nil {
 		return time.Time{}, err
@@ -45,6 +57,10 @@ func (r *RTC) ReadUTC() (time.Time, error) {
 		return time.Time{}, errors.New("malformed RTC calendar")
 	}
 	return t, nil
+}
+
+func (r *RTC) RTCStats() (uint64, uint64, uint64) {
+	return r.reads.Load(), r.nanos.Load(), r.failures.Load()
 }
 func (r *RTC) CorrectWall(t time.Time) error {
 	return unix.ClockSettime(unix.CLOCK_REALTIME, &unix.Timespec{Sec: t.Unix(), Nsec: int64(t.Nanosecond())})

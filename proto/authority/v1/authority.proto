@@ -572,11 +572,27 @@ message OpenRequest {
   OpenFlags flags = 2;
   bool write_intent = 3;
   bool cache_capable = 4;
+  // Linux only, read-only directory access. Requests permission to create
+  // independent local directory handles while this subscription proof lives.
+  uint64 reusable_directory_read_incarnation = 5; // zero requests ordinary OPEN
 }
 message OpenReply {
   bytes handle = 1;
   Delegation delegation = 2;
   bool cache_capable = 3;
+  DirectoryReadProof directory_read_proof = 4;
+}
+// The enclosing handle owns the retained backing description. Stable identity
+// is a binding, never a capability. Attribute withdrawal closes new opens;
+// existing local handles retain their granted rights until final close.
+message DirectoryReadProof {
+  bytes stable_identity = 1;
+  uint64 incarnation = 2;
+  uint64 object_version = 3;
+  uint64 snapshot_sequence = 4;
+  // Evaluated read+search grant. False retains only this OPEN's ordinary
+  // read rights: directories readable without search must remain listable.
+  bool reusable = 5;
 }
 message CloseRequest {
   bytes handle = 1;

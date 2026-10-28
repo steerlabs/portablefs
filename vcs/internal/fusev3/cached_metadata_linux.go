@@ -69,8 +69,8 @@ func (r *rawFileSystem) registerCachedReplyLocked(unique uint64, first, second p
 	r.cachedReplyFree = p.cachedNext
 	p.cachedNext = nil
 	p.owner, p.requestUnique, p.originalFinalized, p.cachedArena = r, unique, true, true
-	p.stamp, p.retainedAnswer = stamp, true
-	p.cachedCoordinates, p.cachedCount = [2]publicationCoordinate{first, second}, count
+	p.stamp, p.retainedAnswer, p.metadataHit = stamp, true, true
+	p.cachedCoordinates, p.cachedCount = [3]publicationCoordinate{first, second}, count
 	r.replyPublications[unique] = p
 	return true
 }
@@ -112,13 +112,18 @@ func (r *workspaceFileSystem) registerWorkspaceCachedReplyLocked(unique uint64, 
 		return false
 	}
 	p.originalFinalized = true
-	p.stamp, p.retainedAnswer = stamp, true
-	p.cachedCoordinates, p.cachedCount = [2]publicationCoordinate{first, second}, count
+	p.stamp, p.retainedAnswer, p.metadataHit = stamp, true, true
+	p.cachedCoordinates, p.cachedCount = [3]publicationCoordinate{first, second}, count
 	r.replyPublications[unique] = p
 	return true
 }
 
-func (r *rawFileSystem) lookupCachedReply(unique uint64, parent *inodeRecord, name string, out *fuse.EntryOut) bool {
+func (r *rawFileSystem) lookupCachedReply(unique uint64, parent *inodeRecord, name string, out *fuse.EntryOut) (hit bool) {
+	defer func() {
+		if !hit {
+			r.recordMetadataMiss()
+		}
+	}()
 	r.mount.epochMu.RLock()
 	defer r.mount.epochMu.RUnlock()
 	key := nameKey{parent: parent.key.inode, name: name}
@@ -143,8 +148,20 @@ func (r *rawFileSystem) lookupCachedReply(unique uint64, parent *inodeRecord, na
 	nameCoordinate := publicationCoordinate{kind: publicationNamespaceName, parent: parent.identity, name: name}
 	if record == nil {
 		if proof := r.completeDirectories[parent.identity]; proof != nil && proof.valid {
+			if _, present := proof.members[name]; present {
+				return false
+			}
+			permission := publicationCoordinate{kind: publicationItemAttributes, item: parent.identity}
+			if proof.members != nil && !r.cachedCoordinateAllowedLocked(permission, proof.permission) {
+				return false
+			}
 			enumeration := publicationCoordinate{kind: publicationItemEnumeration, item: parent.identity}
 			if r.cachedCoordinateAllowedLocked(nameCoordinate, proof.stamp) && r.cachedCoordinateAllowedLocked(enumeration, proof.stamp) && r.registerCachedReplyLocked(unique, nameCoordinate, enumeration, 2) {
+				if proof.members != nil {
+					p := r.replyPublications[unique]
+					p.cachedCoordinates[2] = permission
+					p.cachedCount = 3
+				}
 				*out = fuse.EntryOut{}
 				return true
 			}
@@ -186,7 +203,12 @@ func (r *rawFileSystem) lookupCachedReply(unique uint64, parent *inodeRecord, na
 	return true
 }
 
-func (r *rawFileSystem) attrCachedReply(unique uint64, record *inodeRecord, out *fuse.AttrOut) bool {
+func (r *rawFileSystem) attrCachedReply(unique uint64, record *inodeRecord, out *fuse.AttrOut) (hit bool) {
+	defer func() {
+		if !hit {
+			r.recordMetadataMiss()
+		}
+	}()
 	r.mount.epochMu.RLock()
 	defer r.mount.epochMu.RUnlock()
 	if r.mount.delegations.Owns(record.identity[:]) {

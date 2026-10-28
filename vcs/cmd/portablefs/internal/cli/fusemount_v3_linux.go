@@ -89,6 +89,7 @@ func (m *fuseV3Mount) Close() error   { return m.mount.Close() }
 func (m *fuseV3Mount) WritebackStats() *mountlog.WritebackStats {
 	s := m.mount.WritebackStats()
 	return &mountlog.WritebackStats{
+		Metadata:   s.Metadata,
 		DirtyBytes: s.DirtyBytes, DirtyEntries: s.DirtyEntries,
 		RetainedBytes: s.RetainedBytes, RetainedEntries: s.RetainedEntries,
 		PendingAdmissions: s.PendingAdmissions, FlushingIdentities: s.FlushingIdentities,

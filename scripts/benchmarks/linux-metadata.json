@@ -1,0 +1,102 @@
+{
+  "schema": 1,
+  "corpus": {
+    "url": "https://github.com/torvalds/linux.git",
+    "revision": "60b341b778cc2929df16c0a504c91621b3c6a4ad",
+    "tag": "v2.6.33",
+    "requested_files": 31509,
+    "tracked_files": 31565,
+    "tracked_bytes": 369633952,
+    "selection": "Pinned public substitute: 31,565 files, 56 more than requested; 369,633,952 tracked bytes. The original corpus revision was not supplied."
+  },
+  "tools": {
+    "git": "git version 2.47.3",
+    "rg": "ripgrep 14.1.1",
+    "node": "v22.14.0",
+    "npm": "10.9.2"
+  },
+  "environment": {
+    "LC_ALL": "C",
+    "TZ": "UTC",
+    "GIT_OPTIONAL_LOCKS": "0",
+    "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_CONFIG_GLOBAL": "/dev/null"
+  },
+  "rg_threads": 4,
+  "minimum_repetitions": 20,
+  "npm_fixture": "../../vcs/test/soak/testdata/linux-metadata-npm",
+  "npm_expected_files_min": 3000,
+  "npm_expected_files_max": 8000,
+  "expansion_entries": 1000,
+  "cold_content_scope": "Client clean file pages: POSIX_FADV_DONTNEED on the exact pinned corpus paths. Authority storage cache remains warm. No global cache drop.",
+  "targets_p95_seconds": {
+    "status_warm": 2,
+    "rg_warm": 10,
+    "rg_cold": 25,
+    "clone": 60,
+    "npm_fresh": 15,
+    "npm_noop": 2,
+    "expand_warm": 0.1
+  },
+  "ratio_targets": {
+    "median": 1.1,
+    "p95": 1.2
+  },
+  "rtt_targets_ms": {
+    "p50": 1,
+    "p99": 3
+  },
+  "commands": {
+    "status_warm": [
+      "git",
+      "-c",
+      "core.fsmonitor=false",
+      "status",
+      "--porcelain=v1",
+      "--untracked-files=all"
+    ],
+    "rg_warm": [
+      "rg",
+      "--threads",
+      "4",
+      "--null",
+      "-l",
+      "TODO",
+      "."
+    ],
+    "rg_cold": [
+      "rg",
+      "--threads",
+      "4",
+      "--null",
+      "-l",
+      "TODO",
+      "."
+    ],
+    "clone": [
+      "git",
+      "clone",
+      "--no-local",
+      "{bare_source}",
+      "{destination}"
+    ],
+    "npm_fresh": [
+      "npm",
+      "install",
+      "--offline",
+      "--no-audit",
+      "--no-fund",
+      "--cache",
+      "{npm_cache}"
+    ],
+    "npm_noop": [
+      "npm",
+      "install",
+      "--offline",
+      "--no-audit",
+      "--no-fund",
+      "--cache",
+      "{npm_cache}"
+    ]
+  }
+}

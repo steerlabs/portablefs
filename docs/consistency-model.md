@@ -92,6 +92,24 @@ exact physical-reply transaction as every other cache-installing reply. A mount
 of a volume that declares machine-local routes serves plain READDIR only.
 Kernel directory-page caching is not used.
 
+Ordinary and workspace Linux mounts share one daemon cache for names,
+attributes, reusable directory pages and explicitly authorized directory-read
+proofs. Immutable listing pages are scoped to session/epoch, subscription
+incarnation, directory identity, enumeration generation and input XFS cookie.
+Child attributes have separate versioned coordinates. Missing current PLUS
+attributes require an authority page; a name or stable identity grants no
+capability. Single-flight fills and hits use the raw physical-reply owner.
+Only an uninterrupted retained cookie-zero-to-EOF walk within one generation
+proves completeness. Eviction is a cache miss and drops completeness.
+
+The explicit protocol-8 directory-read proof permits new independent local
+directory handles under unchanged subscription and permission generations.
+Permission withdrawal denies new opens while previously granted handles keep
+their rights. Idle cache descriptions retire through counted close ownership;
+application handles retain their descriptions across payload eviction.
+Kernel entry and attribute validity remain zero, OPENDIR flags remain zero,
+and read-only file KEEP_CACHE behavior is unchanged.
+
 Forward pathname resolution and enumeration are covered. Reverse rendering of
 retained dentries (`getcwd`, `/proc/*/fd`, and `d_path`) is outside the contract.
 Machine-local routes declared by `.portablefs/local-dirs` also have no

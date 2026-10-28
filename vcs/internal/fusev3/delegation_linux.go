@@ -2275,6 +2275,29 @@ func (m *delegationManager) queueClose(ctx context.Context, identity, handle []b
 	return nil
 }
 
+// A cache-owned description retains its original session coordinate after
+// ordinary handle release. Cold buffer reset must not reassign that cleanup.
+func (m *delegationManager) queueRetainedClose(ctx context.Context, pending delegationClose) error {
+	owner, err := m.reserveRetainedClose(pending)
+	if err != nil {
+		return err
+	}
+	owner.dispatch(ctx)
+	return nil
+}
+
+func (m *delegationManager) reserveRetainedClose(pending delegationClose) (*descriptorCleanup, error) {
+	m.closeMu.Lock()
+	if m.closeStopped || m.ctx.Err() != nil {
+		m.closeMu.Unlock()
+		return nil, writeback.ErrClosed
+	}
+	m.closePending++
+	m.closeProducers.Add(1)
+	m.closeMu.Unlock()
+	return &descriptorCleanup{manager: m, pending: pending}, nil
+}
+
 // A malformed allocation cannot be named for cleanup; terminal session teardown
 // must own the table instead. All valid allocating results reserve before any
 // grant, visibility, or post-state validation can return them to their caller.

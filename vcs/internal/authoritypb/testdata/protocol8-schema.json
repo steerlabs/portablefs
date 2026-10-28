@@ -2392,6 +2392,13 @@
           "label": 1,
           "type": 8,
           "json_name": "cacheCapable"
+        },
+        {
+          "name": "reusable_directory_read_incarnation",
+          "number": 5,
+          "label": 1,
+          "type": 4,
+          "json_name": "reusableDirectoryReadIncarnation"
         }
       ]
     },
@@ -2419,6 +2426,54 @@
           "label": 1,
           "type": 8,
           "json_name": "cacheCapable"
+        },
+        {
+          "name": "directory_read_proof",
+          "number": 4,
+          "label": 1,
+          "type": 11,
+          "type_name": ".portablefs.authority.v1.DirectoryReadProof",
+          "json_name": "directoryReadProof"
+        }
+      ]
+    },
+    {
+      "name": "DirectoryReadProof",
+      "field": [
+        {
+          "name": "stable_identity",
+          "number": 1,
+          "label": 1,
+          "type": 12,
+          "json_name": "stableIdentity"
+        },
+        {
+          "name": "incarnation",
+          "number": 2,
+          "label": 1,
+          "type": 4,
+          "json_name": "incarnation"
+        },
+        {
+          "name": "object_version",
+          "number": 3,
+          "label": 1,
+          "type": 4,
+          "json_name": "objectVersion"
+        },
+        {
+          "name": "snapshot_sequence",
+          "number": 4,
+          "label": 1,
+          "type": 4,
+          "json_name": "snapshotSequence"
+        },
+        {
+          "name": "reusable",
+          "number": 5,
+          "label": 1,
+          "type": 8,
+          "json_name": "reusable"
         }
       ]
     },

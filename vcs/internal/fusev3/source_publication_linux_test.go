@@ -94,7 +94,7 @@ func finishDirectSourceLease(t *testing.T, lease *sourcePublicationLease, resolv
 	if resolveNames {
 		lease.resolveAllNoBinding()
 	}
-	if err := lease.markCallbackPublicationReady(); err != nil {
+	if err := lease.markCallbackPublicationReady(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	lease.release()
@@ -390,7 +390,7 @@ func TestCreateReplyBindingDrainsOnlyExactIdentityPublications(t *testing.T) {
 					t.Fatal("create binding did not resume after exact cache publication drained")
 				}
 			}
-			if err := lease.markCallbackPublicationReady(); err != nil {
+			if err := lease.markCallbackPublicationReady(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 			lease.release()
@@ -477,14 +477,14 @@ func TestReplyDiscoveredCoordinateCoOwnershipSurvivesEitherReleaseOrder(t *testi
 			}
 
 			releaseChild := func() {
-				if err := childLease.markCallbackPublicationReady(); err != nil {
+				if err := childLease.markCallbackPublicationReady(context.Background()); err != nil {
 					t.Fatal(err)
 				}
 				childLease.release()
 			}
 			releaseReply := func() {
 				replyLease.resolveAllNoBinding()
-				if err := replyLease.markCallbackPublicationReady(); err != nil {
+				if err := replyLease.markCallbackPublicationReady(context.Background()); err != nil {
 					t.Fatal(err)
 				}
 				replyLease.release()
@@ -559,7 +559,7 @@ func TestSourceDischargeBindsUnknownChildBeforePurging(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("reply-discovered identity did not resume after exact reply drain")
 	}
-	if err := lease.markCallbackPublicationReady(); err != nil {
+	if err := lease.markCallbackPublicationReady(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	lease.release()
@@ -594,7 +594,7 @@ func TestSourceDischargeDoesNotWaitForExistingExactSourceGate(t *testing.T) {
 	if openedEarly {
 		t.Fatal("cache withdrawal reopened a coordinate held by the exact source request")
 	}
-	if err := childLease.markCallbackPublicationReady(); err != nil {
+	if err := childLease.markCallbackPublicationReady(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	childLease.release()
@@ -638,7 +638,7 @@ func BenchmarkSourcePublicationAdmissionWithUnrelatedCoordinates(b *testing.B) {
 					b.Fatal(err)
 				}
 				lease.resolveAllNoBinding()
-				if err := lease.markCallbackPublicationReady(); err != nil {
+				if err := lease.markCallbackPublicationReady(context.Background()); err != nil {
 					b.Fatal(err)
 				}
 				lease.release()
@@ -661,7 +661,7 @@ func TestSourceCompletionWithdrawsSettledAttributesAndKeepsDataObligation(t *tes
 			f.raw.cachedAttrPayloads[record.identity] = cachedAttrPayload{attr: &authoritypb.Attr{Nlink: 2}}
 			f.raw.cachedData[record.key.inode] = record
 			f.raw.mu.Unlock()
-			if err := lease.markCallbackPublicationReady(); err != nil {
+			if err := lease.markCallbackPublicationReady(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 			f.raw.mu.Lock()
@@ -762,7 +762,7 @@ func TestNamespaceSourceGateCoversEveryEmittedChangeKind(t *testing.T) {
 				}
 			}
 			f.raw.mu.Unlock()
-			if err := lease.markCallbackPublicationReady(); err != nil {
+			if err := lease.markCallbackPublicationReady(context.Background()); err != nil {
 				t.Fatal(err)
 			}
 			dir.mu.Lock()

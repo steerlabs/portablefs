@@ -117,7 +117,7 @@ func (r *rawFileSystem) writeStockAttempt(input *fuse.WriteIn, data []byte, unac
 				if cut.Sequence == 0 {
 					completionErr = lease.markDefiniteNoChange()
 				} else {
-					completionErr = lease.markCallbackPublicationReady()
+					completionErr = lease.markCallbackPublicationReady(ctx)
 				}
 				if completionErr != nil {
 					r.mount.revoke(completionErr)

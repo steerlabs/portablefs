@@ -6,6 +6,8 @@ import (
 	"time"
 )
 
+var workerProcessStartUnixNanos = time.Now().UnixNano()
+
 type Operation uint8
 
 const (
@@ -148,9 +150,13 @@ func New(volume string) (*Metrics, error) {
 		return nil, fmt.Errorf("authoritymetrics: volume is required")
 	}
 	registry := NewRegistry()
+	processStart, err := registry.RegisterGauge("portablefs_authority_process_start_unix_nanos", "Worker process-start witness for comparable diagnostic counter snapshots.", Label{Name: "volume", Value: volume})
+	if err != nil {
+		return nil, err
+	}
+	processStart.Set(workerProcessStartUnixNanos)
 	metrics := &Metrics{volume: volume, registry: registry}
 	base := Label{Name: "volume", Value: volume}
-	var err error
 	for operation := Operation(0); operation < operationCount; operation++ {
 		for outcome := Outcome(0); outcome < outcomeCount; outcome++ {
 			metrics.rpc[operation][outcome].requests, err = registry.RegisterCounter(

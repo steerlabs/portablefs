@@ -162,7 +162,8 @@ type Config struct {
 	PresentedGID uint32
 	// NameCacheCapacity bounds the names, proven absences and attributes the
 	// daemon caches under its subscription. Kernel dentry and attribute
-	// validity is always zero. Zero selects defaultNameCacheCapacity.
+	// validity is always zero. Zero selects defaultNameCacheCapacity; larger
+	// requests are capped at the same 65,536-name mount budget.
 	NameCacheCapacity int
 	// WithdrawalTimeout bounds one withdrawal of kernel cache state before the
 	// mount revokes itself. Zero selects defaultWithdrawalTimeout.
@@ -225,6 +226,7 @@ func markCleanStartupFailure(cause error) error {
 }
 
 type Mount struct {
+	metadataFUSE   metadataFUSECounter
 	managedRemoval func(string, error) error
 	workspaceRTC   permissionclock.UTCReader
 	workspace      *workspaceadmission.Reader
@@ -439,7 +441,7 @@ func MountVolume(parent, startup context.Context, mountpoint string, rpc RPC, cf
 		return nil, markCleanStartupFailure(cause)
 	}
 	m.server = server
-	server.RecordLatencies(cfg.latencies)
+	server.RecordLatencies(&m.metadataFUSE)
 	m.setNotifier(server)
 	if !m.raw.replyLifecycleReady() {
 		// NewServer has already installed the mount and consumed INIT, but Serve
@@ -610,6 +612,7 @@ func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 	if cfg.NameCacheCapacity <= 0 {
 		cfg.NameCacheCapacity = defaultNameCacheCapacity
 	}
+	cfg.NameCacheCapacity = min(cfg.NameCacheCapacity, defaultNameCacheCapacity)
 	if cfg.WithdrawalTimeout <= 0 {
 		cfg.WithdrawalTimeout = defaultWithdrawalTimeout
 	}
@@ -635,6 +638,7 @@ func newMount(parent context.Context, rpc RPC, cfg Config) *Mount {
 
 		requireRemountOnEpochChange: cfg.RequireRemountOnEpochChange || cfg.workspace != nil,
 	}
+	mount.metadataFUSE.upstream = cfg.latencies
 	if cfg.Managed != nil {
 		mount.managedRemoval = cfg.Managed.Remove
 		mount.workspaceRTC = cfg.Managed.RTC
@@ -1511,6 +1515,7 @@ type fileHandle struct {
 }
 
 type dirHandle struct {
+	backing           *directoryBacking
 	node              *node
 	stale             atomic.Bool
 	barrierLoss       uint64
@@ -2241,13 +2246,6 @@ func (n *node) OpendirHandle(ctx context.Context, flags uint32) (*dirHandle, uin
 	if flags&uint32(syscall.O_ACCMODE) != uint32(syscall.O_RDONLY) {
 		return nil, 0, syscall.EISDIR
 	}
-	if err := n.mount.delegations.waitCloseCapacity(ctx); err != nil {
-		return nil, 0, bufferErrno(err)
-	}
-	response, errno := n.mutate(ctx, &authoritypb.Request{Body: &authoritypb.Request_Open{Open: &authoritypb.OpenRequest{Item: cloneBytes(n.item.GetToken()), Flags: &authoritypb.OpenFlags{Read: true}}}})
-	if errno != 0 {
-		return nil, 0, errno
-	}
 	if _, ok := publicationIdentityFromItem(n.item); !ok {
 		// An item with no stable identity has no coordinate to be covered by, so
 		// no lease could name it and no recall could reach it. That is a genuine
@@ -2255,14 +2253,8 @@ func (n *node) OpendirHandle(ctx context.Context, flags uint32) (*dirHandle, uin
 		n.mount.revoke(errors.New("fusev3: successful directory OPEN carried no stable identity"))
 		return nil, 0, syscall.ENOTCONN
 	}
-	owner, err := n.mount.ownDescriptor(n.item.GetStableIdentity(), response.GetOpen().GetHandle())
-	if err != nil {
-		return nil, 0, syscall.EIO
-	}
-	defer owner.dispatch(ctx)
-	root := bytes.Equal(n.item.GetStableIdentity(), n.mount.rpc.Root().GetStableIdentity())
-	owner.transfer()
-	return &dirHandle{node: n, token: cloneBytes(response.GetOpen().GetHandle()), rootBarrier: root, barrierLoss: n.mount.delegations.LossSequence()}, 0, 0
+	handle, errno := n.openReusableDirectory(ctx)
+	return handle, 0, errno
 }
 
 // peek returns the next directory entry without consuming it, fetching another
@@ -2315,6 +2307,20 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPl
 			// permission, including itemless rows and a retained EOF.
 			publication.stamp, publication.retainedAnswer = h.pageStamp, true
 		}
+		// Membership can remain unchanged while a child changes size or mode.
+		// A later callback cannot inherit that buffered attribute sample. Keep
+		// the last consumed XFS cookie and refresh through the existing page RPC;
+		// the subscription-owned names page remains independently reusable.
+		if wantItems && publication != nil && publication.requestUnique != h.pageRequest && h.pageStamp.incarnation != 0 && h.index < len(h.page) {
+			entry := h.page[h.index]
+			if identity, ok := publicationIdentityFromBytes(entry.GetStableIdentity()); ok && h.node.mount.subscription.remaining(publicationCoordinate{kind: publicationItemAttributes, item: identity}, h.pageStamp, h.pageStamp.version) <= 0 {
+				h.discardPageItemsLocked()
+				h.page, h.index, h.pending, h.pendingDirent, h.pendingCookie = nil, 0, nil, nil, nil
+				h.pageStamp = subscriptionStamp{}
+				h.eof, h.pageWithdrawn = false, false
+				h.cursorGeneration++
+			}
+		}
 		if h.pending != nil {
 			return h.pending, h.pendingDirent, 0
 		}
@@ -2342,29 +2348,19 @@ func (h *dirHandle) peek(ctx context.Context, wantItems bool, boundary ...*dirPl
 			metadataClock := h.node.mount.delegations.metadataClock.Load()
 			requestCookie := cloneBytes(h.cookie)
 			directoryIdentity, identityOK := publicationIdentityFromItem(h.node.item)
-			var heldIdentities [][]byte
-			if wantItems && identityOK && h.node.mount.raw != nil {
-				heldIdentities = h.node.mount.raw.heldDirectoryPageIdentities(directoryIdentity, requestCookie)
-			}
 			request := &authoritypb.Request{Body: &authoritypb.Request_ReadDir{ReadDir: &authoritypb.ReadDirRequest{
-				Handle: cloneBytes(h.token), Cookie: requestCookie, MaxEntries: 256, WantItems: wantItems, HeldIdentities: heldIdentities,
+				Handle: cloneBytes(h.token), Cookie: requestCookie, MaxEntries: 256, WantItems: wantItems,
 			}}}
 			h.fetching = true
 			h.fetchDone = make(chan struct{})
 			done := h.fetchDone
 			h.mu.Unlock()
-			// A withdrawn PLUS page can discard every capability without
-			// reaching intern. Throttle replacement pages before minting more
-			// cleanup debt, outside the cursor lock needed by withdrawal.
 			var response *authoritypb.Response
 			var errno syscall.Errno
-			if wantItems {
-				admitCtx, cancel := context.WithTimeout(ctx, h.node.requestTimeout)
-				errno = contextErrno(h.node.mount.reclaim.admit(admitCtx))
-				cancel()
-			}
-			if errno == 0 {
-				response, errno = h.node.mutate(ctx, request)
+			if raw := h.node.mount.raw; raw != nil {
+				response, pageStamp, errno = raw.readDirectoryPage(ctx, h, request, pageStamp)
+			} else {
+				response, errno = h.fetchDirectoryPage(ctx, request)
 			}
 			h.mu.Lock()
 			h.fetching = false
@@ -2579,6 +2575,11 @@ func (h *dirHandle) invalidateEnumeration() {
 	h.withdrawals++
 	h.eof = false
 	h.uncovered = false
+	if raw := h.node.mount.raw; raw != nil {
+		raw.mu.Lock()
+		raw.dropDirectoryPagesLocked(h.enumerationIdentity())
+		raw.mu.Unlock()
+	}
 }
 
 func (h *dirHandle) enumerationIdentity() publicationIdentity {
@@ -2676,7 +2677,11 @@ func (h *dirHandle) closeForCleanup(ctx context.Context) resourceCleanupError {
 		h.mu.Lock()
 		h.discardPageItemsLocked()
 		h.mu.Unlock()
-		h.closeOutcome.cause = h.node.mount.delegations.queueClose(ctx, h.node.item.GetStableIdentity(), h.token, 0, false)
+		if h.backing != nil && h.node.mount.raw != nil {
+			h.node.mount.raw.releaseDirectoryBacking(ctx, h.backing)
+		} else {
+			h.closeOutcome.cause = h.node.mount.delegations.queueClose(ctx, h.node.item.GetStableIdentity(), h.token, 0, false)
+		}
 	})
 	return h.closeOutcome
 }
@@ -3238,7 +3243,7 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 				if cut.Sequence == 0 {
 					transitionErr = completeDefiniteNoChangePublication(ctx)
 				} else {
-					transitionErr = lease.markCallbackPublicationReady()
+					transitionErr = lease.markCallbackPublicationReady(ctx)
 				}
 				if transitionErr != nil {
 					n.mount.revoke(fmt.Errorf("fusev3: settle delegated SETATTR refusal: %w", transitionErr))
@@ -3248,7 +3253,7 @@ func (n *node) Setattr(ctx context.Context, fh *fileHandle, in *fuse.SetAttrIn, 
 			return bufferErrno(admissionErr)
 		}
 		if err := n.invalidateOwnData(ctx, 0, 0); err != nil {
-			if transitionErr := lease.markCallbackPublicationReady(); transitionErr != nil {
+			if transitionErr := lease.markCallbackPublicationReady(ctx); transitionErr != nil {
 				n.mount.revoke(fmt.Errorf("fusev3: settle accepted SETATTR after invalidation failure: %w", transitionErr))
 			}
 			return syscall.EIO

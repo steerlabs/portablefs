@@ -139,6 +139,7 @@ type subscriptionRegistry struct {
 	active                 bool
 	paused                 bool
 	incarnation            uint64
+	coldInstalls           uint64
 	generation             uint64
 	watermark              uint64
 	horizon                time.Time
@@ -635,6 +636,7 @@ func (s *subscriptionRegistry) subscribe(ctx context.Context) error {
 			s.workspaceProof = proof
 			s.active = true
 			s.incarnation = incarnation
+			s.coldInstalls++
 			s.generation++
 			s.watermark = watermark
 			s.horizon = horizon
@@ -1334,6 +1336,12 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 	for identity := range r.completeDirectories {
 		coordinates[publicationCoordinate{kind: publicationItemEnumeration, item: identity}] = struct{}{}
 	}
+	for key := range r.directories.pages {
+		coordinates[publicationCoordinate{kind: publicationItemEnumeration, item: key.directory}] = struct{}{}
+	}
+	for identity := range r.directories.proofs {
+		coordinates[publicationCoordinate{kind: publicationItemAttributes, item: identity}] = struct{}{}
+	}
 	for coordinate := range r.cacheReservations {
 		coordinates[coordinate] = struct{}{}
 	}
@@ -1401,6 +1409,7 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 
 	r.mu.Lock()
 	clear(r.directoryPageHints)
+	r.coldDirectoryCacheLocked()
 	type nameInvalidation struct {
 		parent uint64
 		name   string
@@ -1454,12 +1463,13 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 	for _, handle := range dirHandles {
 		handle.invalidateEnumeration()
 	}
+	r.flushDirectoryRetirements(ctx)
 	notifier := r.mount.notifier()
 	if notifier == nil && len(nameInvalidations)+len(dataRecords)+len(attrRecords) != 0 {
 		return errors.New("fusev3: cold cache invalidation has no kernel notification channel")
 	}
 	for _, name := range nameInvalidations {
-		if status := notifier.EntryNotify(name.parent, name.name); !status.Ok() && status != fuse.ENOENT {
+		if status := r.mount.entryNotify(notifier, name.parent, name.name); !status.Ok() && status != fuse.ENOENT {
 			return fmt.Errorf("fusev3: cold invalidate name %q under inode %d: %v", name.name, name.parent, status)
 		}
 	}
@@ -1488,7 +1498,7 @@ func (r *rawFileSystem) invalidateAllCaches(ctx context.Context) error {
 		if data {
 			offset = 0
 		}
-		if status := notifier.InodeNotify(record.id, offset, 0); !status.Ok() && status != fuse.ENOENT {
+		if status := r.mount.inodeNotify(notifier, record.id, offset, 0); !status.Ok() && status != fuse.ENOENT {
 			return fmt.Errorf("fusev3: cold invalidate inode %d: %v", record.id, status)
 		}
 	}

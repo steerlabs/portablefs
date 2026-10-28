@@ -319,7 +319,7 @@ func (c *unixReauthorizationControl) handlePeer(connection *net.UnixConn, arriva
 			writeLocalReauthorizationResponse(connection, localReauthorizationResponse{Error: "exact live mount loss snapshot unavailable"})
 			return
 		}
-		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{OK: true, MountInstanceID: snapshot.MountInstanceID, LossSequence: snapshot.LossSequence})
+		writeLocalReauthorizationResponse(connection, localReauthorizationResponse{OK: true, MountInstanceID: snapshot.MountInstanceID, LossSequence: snapshot.LossSequence, Metadata: snapshot.Metadata})
 		return
 	}
 	if request.Operation != "" || request.MountInstanceID != "" || c.handler == nil || request.Sequence == 0 || request.Capability == "" || len(request.Capability) > 32<<10 || request.ClientCertificatePEM == "" || len(request.ClientCertificatePEM) > maxClientIdentityBytes {
@@ -427,7 +427,7 @@ func readFuseMountLoss(ctx context.Context, state *mountState, instance string) 
 	if !response.OK || response.Error != "" || response.MountInstanceID != instance || !validLossSequence(response.LossSequence) || response.Sequence != 0 || response.AuthorizationDeadlineUnixMs != 0 {
 		return mountLossSnapshot{}, errors.New("exact live mount loss snapshot refused")
 	}
-	return mountLossSnapshot{MountInstanceID: response.MountInstanceID, LossSequence: response.LossSequence}, nil
+	return mountLossSnapshot{MountInstanceID: response.MountInstanceID, LossSequence: response.LossSequence, Metadata: response.Metadata}, nil
 }
 
 func validLossSequence(value string) bool {

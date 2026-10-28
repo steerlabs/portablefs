@@ -3403,6 +3403,10 @@ func (*resourceAdmissionFaultStore) SearchPermitted(xfsstore.Capability) (bool, 
 	return true, nil
 }
 
+func (*resourceAdmissionFaultStore) DirectoryReadPermitted(xfsstore.Capability) (bool, error) {
+	return true, nil
+}
+
 func registerTestWriter(t *testing.T, h *VolumeHandler, cred volumeserver.SessionCredential) {
 	t.Helper()
 	terminal, err := h.Runtime.SessionTerminal(cred.ID)
