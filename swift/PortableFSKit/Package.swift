@@ -23,7 +23,7 @@ let package = Package(
         .executable(name: "portablefs-workspace-service-test-host", targets: ["WorkspaceServiceTestHost"])
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-protobuf.git", exact: "1.39.0")
+        .package(url: "https://github.com/apple/swift-protobuf.git", exact: "1.40.0")
     ],
     targets: [
         .target(name: "CWorkspacePower", cSettings: [.define("PFS_WORKSPACE_BUILD_COMMIT", to: "\"" + workspaceCommit + "\"")]),
