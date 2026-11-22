@@ -44,7 +44,7 @@ jobs:
           version="$(cat VERSION)"
           printf '%s\n' "$version" | cmp -s - VERSION
           test "$GITHUB_REF_NAME" = "v$version"
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
@@ -95,7 +95,7 @@ jobs:
         with:
           fetch-depth: 0 # goreleaser needs full history for the changelog
           persist-credentials: false # release auth flows via GITHUB_TOKEN env below
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
@@ -241,7 +241,7 @@ jobs:
           xcodebuild -version
           test "$(xcodebuild -version)" = $'Xcode 27.1\nBuild version 27A9275'
           test "$(xcrun --sdk macosx --show-sdk-version)" = 27.0
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: vcs/go.mod
           cache-dependency-path: vcs/go.sum
@@ -267,7 +267,7 @@ jobs:
       - name: Test the Swift app and installer core
         run: bash scripts/test-swift-xcode.sh
 
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: linux-workspace-arm64-${{ github.sha }}
           path: ${{ runner.temp }}/guest-artifact
@@ -497,7 +497,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: linux-workspace-arm64-${{ github.sha }}
           path: ${{ runner.temp }}/guest-artifact
